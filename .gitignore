@@ -1,0 +1,37 @@
+# Rust / Cargo build artifacts
+/target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# Compiled binaries and executables
+*.exe
+*.dll
+*.so
+*.dylib
+*.lib
+*.a
+The Scribes Ledger.exe
+
+# Generated output and temporary files
+*.pdf
+*.typ
+*.log
+*.tmp
+
+# Local user projects and imported workspaces
+novel_project/
+*_ScribesLedger/
+READ-ONLY/
+
+# Operating System specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE and Editor configurations
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
