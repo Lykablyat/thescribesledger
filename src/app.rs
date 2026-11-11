@@ -2,17 +2,147 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 use crate::compile::compile_book_to_pdf;
 use crate::compiler::compile_to_pdf;
 use crate::project::{BookProject, ChapterKind};
 use crate::scrivener::ScrivenerImporter;
 
-/// Font family choices available in the format bar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Font family choices available in the format bar and editor profiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FontFamilyChoice {
     Serif,
     Proportional,
     Monospace,
+}
+
+/// A customizable styling profile for the central writing canvas.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EditorProfile {
+    pub name: String,
+    #[serde(default)]
+    pub is_builtin: bool,
+    pub page_color: [u8; 3],       // [R, G, B]
+    pub writing_color: [u8; 3],    // [R, G, B]
+    pub font_family: FontFamilyChoice,
+    pub font_size: f32,
+    pub line_spacing: f32,
+}
+
+/// Persisted configuration for application theme and editor styling profiles.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EditorSettingsConfig {
+    #[serde(default)]
+    pub dark_mode: bool,
+    #[serde(default = "default_active_profile")]
+    pub active_profile: String,
+    #[serde(default = "default_profiles")]
+    pub profiles: Vec<EditorProfile>,
+}
+
+fn default_active_profile() -> String {
+    "Default Ledger".to_string()
+}
+
+pub fn default_profiles() -> Vec<EditorProfile> {
+    vec![
+        EditorProfile {
+            name: "Default Ledger".to_string(),
+            is_builtin: true,
+            page_color: [255, 255, 255],
+            writing_color: [30, 36, 32],
+            font_family: FontFamilyChoice::Serif,
+            font_size: 15.0,
+            line_spacing: 1.0,
+        },
+        EditorProfile {
+            name: "Warm Parchment".to_string(),
+            is_builtin: true,
+            page_color: [250, 246, 238],
+            writing_color: [42, 36, 33],
+            font_family: FontFamilyChoice::Serif,
+            font_size: 15.0,
+            line_spacing: 1.05,
+        },
+        EditorProfile {
+            name: "Classic Sepia".to_string(),
+            is_builtin: true,
+            page_color: [244, 236, 216],
+            writing_color: [62, 39, 35],
+            font_family: FontFamilyChoice::Serif,
+            font_size: 15.0,
+            line_spacing: 1.0,
+        },
+        EditorProfile {
+            name: "Night Scribe".to_string(),
+            is_builtin: true,
+            page_color: [34, 38, 36],
+            writing_color: [226, 236, 229],
+            font_family: FontFamilyChoice::Serif,
+            font_size: 15.0,
+            line_spacing: 1.0,
+        },
+        EditorProfile {
+            name: "Obsidian Clean".to_string(),
+            is_builtin: true,
+            page_color: [22, 25, 24],
+            writing_color: [216, 226, 220],
+            font_family: FontFamilyChoice::Proportional,
+            font_size: 15.0,
+            line_spacing: 1.0,
+        },
+        EditorProfile {
+            name: "Terminal Green".to_string(),
+            is_builtin: true,
+            page_color: [18, 22, 20],
+            writing_color: [74, 222, 128],
+            font_family: FontFamilyChoice::Monospace,
+            font_size: 14.0,
+            line_spacing: 1.0,
+        },
+    ]
+}
+
+impl Default for EditorSettingsConfig {
+    fn default() -> Self {
+        Self {
+            dark_mode: false,
+            active_profile: default_active_profile(),
+            profiles: default_profiles(),
+        }
+    }
+}
+
+impl EditorSettingsConfig {
+    pub fn config_path() -> PathBuf {
+        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        current_dir.join("editor_settings.toml")
+    }
+
+    pub fn load_or_default() -> Self {
+        let path = Self::config_path();
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(mut config) = toml::from_str::<EditorSettingsConfig>(&content) {
+                    let defaults = default_profiles();
+                    for def_p in defaults {
+                        if !config.profiles.iter().any(|p| p.name == def_p.name) {
+                            config.profiles.push(def_p);
+                        }
+                    }
+                    return config;
+                }
+            }
+        }
+        Self::default()
+    }
+
+    pub fn save(&self) {
+        let path = Self::config_path();
+        if let Ok(content) = toml::to_string_pretty(self) {
+            let _ = std::fs::write(path, content);
+        }
+    }
 }
 
 impl FontFamilyChoice {
@@ -164,6 +294,14 @@ pub struct BookApp {
 
     // Editor formatting display toggle
     pub markdown_in_editor: bool,
+
+    // Dark mode and editor profiles
+    pub dark_mode: bool,
+    pub active_profile_name: String,
+    pub profiles: Vec<EditorProfile>,
+    pub show_editor_settings_modal: bool,
+    pub show_new_profile_modal: bool,
+    pub new_profile_name_input: String,
 }
 
 impl Default for BookApp {
@@ -208,15 +346,26 @@ impl Default for BookApp {
             rename_input: String::new(),
             delete_target: None,
             markdown_in_editor: true,
+            dark_mode: false,
+            active_profile_name: "Default Ledger".to_string(),
+            profiles: default_profiles(),
+            show_editor_settings_modal: false,
+            show_new_profile_modal: false,
+            new_profile_name_input: "My Custom Profile".to_string(),
         }
     }
 }
 
 impl BookApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        configure_scrivener_theme_and_fonts(&cc.egui_ctx);
-
         let mut app = Self::default();
+        let loaded_config = EditorSettingsConfig::load_or_default();
+        app.dark_mode = loaded_config.dark_mode;
+        app.profiles = loaded_config.profiles;
+        app.apply_profile_by_name(&loaded_config.active_profile);
+
+        load_system_serif_fonts(&cc.egui_ctx);
+        app.apply_visuals(&cc.egui_ctx);
 
         // Check if an existing project is in current directory or a default location
         let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -242,6 +391,224 @@ impl BookApp {
 
     pub fn set_status(&mut self, msg: impl Into<String>) {
         self.status_message = Some((msg.into(), Instant::now()));
+    }
+
+
+    pub fn is_dark_mode(&self) -> bool {
+        self.dark_mode
+    }
+
+    pub fn active_profile(&self) -> Option<&EditorProfile> {
+        self.profiles.iter().find(|p| p.name == self.active_profile_name)
+    }
+
+    pub fn active_profile_mut(&mut self) -> Option<&mut EditorProfile> {
+        let name = self.active_profile_name.clone();
+        self.profiles.iter_mut().find(|p| p.name == name)
+    }
+
+    pub fn current_page_color(&self) -> egui::Color32 {
+        if let Some(prof) = self.active_profile() {
+            egui::Color32::from_rgb(prof.page_color[0], prof.page_color[1], prof.page_color[2])
+        } else {
+            SCRIV_PAPER_BG
+        }
+    }
+
+    pub fn current_writing_color(&self) -> egui::Color32 {
+        if let Some(prof) = self.active_profile() {
+            egui::Color32::from_rgb(prof.writing_color[0], prof.writing_color[1], prof.writing_color[2])
+        } else {
+            SCRIV_TEXT_DARK
+        }
+    }
+
+    pub fn apply_profile_by_name(&mut self, name: &str) {
+        if let Some(prof) = self.profiles.iter().find(|p| p.name == name).cloned() {
+            self.active_profile_name = prof.name.clone();
+            self.font_family = prof.font_family;
+            self.font_size = prof.font_size;
+            self.line_spacing = prof.line_spacing;
+            self.save_settings_config();
+        }
+    }
+
+    pub fn create_profile_from_current(&mut self, name: String) {
+        let clean_name = name.trim().to_string();
+        if clean_name.is_empty() {
+            return;
+        }
+        let current_page = self.current_page_color();
+        let current_text = self.current_writing_color();
+        let new_prof = EditorProfile {
+            name: clean_name.clone(),
+            is_builtin: false,
+            page_color: [current_page.r(), current_page.g(), current_page.b()],
+            writing_color: [current_text.r(), current_text.g(), current_text.b()],
+            font_family: self.font_family,
+            font_size: self.font_size,
+            line_spacing: self.line_spacing,
+        };
+        if let Some(existing) = self.profiles.iter_mut().find(|p| p.name == clean_name) {
+            *existing = new_prof;
+        } else {
+            self.profiles.push(new_prof);
+        }
+        self.apply_profile_by_name(&clean_name);
+        self.set_status(format!("Created profile '{}'", clean_name));
+    }
+
+    pub fn save_settings_config(&self) {
+        let config = EditorSettingsConfig {
+            dark_mode: self.dark_mode,
+            active_profile: self.active_profile_name.clone(),
+            profiles: self.profiles.clone(),
+        };
+        config.save();
+    }
+
+    pub fn theme_menu_bar_bg(&self) -> egui::Color32 {
+        if self.dark_mode {
+            egui::Color32::from_rgb(26, 32, 28)
+        } else {
+            egui::Color32::from_rgb(248, 250, 248)
+        }
+    }
+
+    pub fn theme_toolbar_bg(&self) -> egui::Color32 {
+        if self.dark_mode {
+            egui::Color32::from_rgb(22, 28, 24)
+        } else {
+            SCRIV_TOOLBAR_BG
+        }
+    }
+
+    pub fn theme_format_bar_bg(&self) -> egui::Color32 {
+        if self.dark_mode {
+            egui::Color32::from_rgb(28, 34, 30)
+        } else {
+            SCRIV_FORMAT_BAR_BG
+        }
+    }
+
+    pub fn theme_header_bar_bg(&self) -> egui::Color32 {
+        if self.dark_mode {
+            egui::Color32::from_rgb(32, 38, 34)
+        } else {
+            SCRIV_HEADER_BAR_BG
+        }
+    }
+
+    pub fn theme_binder_bg(&self) -> egui::Color32 {
+        if self.dark_mode {
+            egui::Color32::from_rgb(20, 25, 22)
+        } else {
+            SCRIV_BINDER_BG
+        }
+    }
+
+    pub fn theme_binder_header_bg(&self) -> egui::Color32 {
+        if self.dark_mode {
+            egui::Color32::from_rgb(30, 38, 33)
+        } else {
+            egui::Color32::from_rgb(232, 238, 234)
+        }
+    }
+
+    pub fn theme_binder_selected_bg(&self) -> egui::Color32 {
+        if self.dark_mode {
+            egui::Color32::from_rgb(40, 68, 50)
+        } else {
+            SCRIV_BINDER_SELECTED_BG
+        }
+    }
+
+    pub fn theme_canvas_bg(&self) -> egui::Color32 {
+        if self.dark_mode {
+            egui::Color32::from_rgb(14, 18, 16)
+        } else {
+            SCRIV_CANVAS_BG
+        }
+    }
+
+    pub fn theme_border(&self) -> egui::Color32 {
+        if self.dark_mode {
+            egui::Color32::from_rgb(46, 58, 50)
+        } else {
+            SCRIV_BORDER
+        }
+    }
+
+    pub fn theme_text_dark(&self) -> egui::Color32 {
+        if self.dark_mode {
+            egui::Color32::from_rgb(226, 236, 230)
+        } else {
+            SCRIV_TEXT_DARK
+        }
+    }
+
+    pub fn theme_text_muted(&self) -> egui::Color32 {
+        if self.dark_mode {
+            egui::Color32::from_rgb(145, 165, 152)
+        } else {
+            SCRIV_TEXT_MUTED
+        }
+    }
+
+    pub fn theme_accent_green(&self) -> egui::Color32 {
+        if self.dark_mode {
+            egui::Color32::from_rgb(64, 185, 115)
+        } else {
+            SCRIV_FOLDER_BLUE
+        }
+    }
+
+    pub fn theme_accent_gold(&self) -> egui::Color32 {
+        if self.dark_mode {
+            egui::Color32::from_rgb(100, 205, 140)
+        } else {
+            SCRIV_SPECIAL_GOLD
+        }
+    }
+
+    pub fn theme_input_bg(&self) -> egui::Color32 {
+        if self.dark_mode {
+            egui::Color32::from_rgb(28, 35, 30)
+        } else {
+            egui::Color32::WHITE
+        }
+    }
+
+    pub fn apply_visuals(&self, ctx: &egui::Context) {
+        if self.dark_mode {
+            let mut visuals = egui::Visuals::dark();
+            visuals.panel_fill = self.theme_canvas_bg();
+            visuals.window_fill = self.theme_format_bar_bg();
+            visuals.faint_bg_color = self.theme_binder_bg();
+            visuals.extreme_bg_color = self.theme_input_bg();
+            visuals.selection.bg_fill = egui::Color32::from_rgb(38, 88, 56);
+            visuals.selection.stroke = egui::Stroke::new(1.0_f32, self.theme_text_dark());
+            visuals.widgets.noninteractive.fg_stroke.color = self.theme_text_dark();
+            visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(32, 40, 35);
+            visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, self.theme_border());
+            visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(44, 58, 48);
+            visuals.widgets.active.bg_fill = self.theme_binder_selected_bg();
+            ctx.set_visuals(visuals);
+        } else {
+            let mut visuals = egui::Visuals::light();
+            visuals.panel_fill = SCRIV_CANVAS_BG;
+            visuals.window_fill = egui::Color32::from_rgb(248, 250, 248);
+            visuals.faint_bg_color = SCRIV_BINDER_BG;
+            visuals.extreme_bg_color = egui::Color32::WHITE;
+            visuals.selection.bg_fill = egui::Color32::from_rgb(205, 226, 212);
+            visuals.selection.stroke = egui::Stroke::new(1.0_f32, SCRIV_TEXT_DARK);
+            visuals.widgets.noninteractive.fg_stroke.color = SCRIV_TEXT_DARK;
+            visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(252, 253, 252);
+            visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, SCRIV_BORDER);
+            visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(234, 242, 236);
+            visuals.widgets.active.bg_fill = SCRIV_BINDER_SELECTED_BG;
+            ctx.set_visuals(visuals);
+        }
     }
 
     pub fn open_project_metadata_modal(&mut self) {
@@ -888,8 +1255,7 @@ impl Drop for BookApp {
 
 impl eframe::App for BookApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        // Match Scrivener light background so swapchain buffer transitions never flash black
-        SCRIV_CANVAS_BG.to_normalized_gamma_f32()
+        self.theme_canvas_bg().to_normalized_gamma_f32()
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -944,14 +1310,19 @@ impl eframe::App for BookApp {
         // 4. Render modal dialogs
         self.render_modals(ctx);
 
+        // Ensure visuals match dark_mode state
+        if ctx.style().visuals.dark_mode != self.dark_mode {
+            self.apply_visuals(ctx);
+        }
+
         // 5. Scrivener 3 Top Menu Bar (File, Edit, Insert, View, Project, Format, Compile)
         egui::TopBottomPanel::top("scrivener_menu_bar")
             .exact_height(24.0)
             .frame(
                 egui::Frame::NONE
-                    .fill(egui::Color32::from_rgb(248, 250, 248))
+                    .fill(self.theme_menu_bar_bg())
                     .inner_margin(egui::Margin::symmetric(8, 2))
-                    .stroke(egui::Stroke::new(1.0_f32, SCRIV_BORDER)),
+                    .stroke(egui::Stroke::new(1.0_f32, self.theme_border())),
             )
             .show(ctx, |ui| {
                 self.render_menu_bar(ui);
@@ -962,9 +1333,9 @@ impl eframe::App for BookApp {
             .exact_height(38.0)
             .frame(
                 egui::Frame::NONE
-                    .fill(SCRIV_TOOLBAR_BG)
+                    .fill(self.theme_toolbar_bg())
                     .inner_margin(egui::Margin::symmetric(10, 4))
-                    .stroke(egui::Stroke::new(1.0_f32, SCRIV_BORDER)),
+                    .stroke(egui::Stroke::new(1.0_f32, self.theme_border())),
             )
             .show(ctx, |ui| {
                 self.render_scrivener_main_toolbar(ui);
@@ -979,8 +1350,8 @@ impl eframe::App for BookApp {
                 .max_width(420.0)
                 .frame(
                     egui::Frame::NONE
-                        .fill(SCRIV_BINDER_BG)
-                        .stroke(egui::Stroke::new(1.0_f32, SCRIV_BORDER)),
+                        .fill(self.theme_binder_bg())
+                        .stroke(egui::Stroke::new(1.0_f32, self.theme_border())),
                 )
                 .show(ctx, |ui| {
                     self.render_sidebar(ui);
@@ -993,9 +1364,9 @@ impl eframe::App for BookApp {
             .exact_height(30.0)
             .frame(
                 egui::Frame::NONE
-                    .fill(SCRIV_FORMAT_BAR_BG)
+                    .fill(self.theme_format_bar_bg())
                     .inner_margin(egui::Margin::symmetric(10, 3))
-                    .stroke(egui::Stroke::new(0.5_f32, SCRIV_BORDER)),
+                    .stroke(egui::Stroke::new(0.5_f32, self.theme_border())),
             )
             .show(ctx, |ui| {
                 self.render_format_bar(ui);
@@ -1007,9 +1378,9 @@ impl eframe::App for BookApp {
             .exact_height(27.0)
             .frame(
                 egui::Frame::NONE
-                    .fill(SCRIV_HEADER_BAR_BG)
+                    .fill(self.theme_header_bar_bg())
                     .inner_margin(egui::Margin::symmetric(10, 3))
-                    .stroke(egui::Stroke::new(0.5_f32, SCRIV_BORDER)),
+                    .stroke(egui::Stroke::new(0.5_f32, self.theme_border())),
             )
             .show(ctx, |ui| {
                 self.render_doc_header_bar(ui);
@@ -1021,9 +1392,9 @@ impl eframe::App for BookApp {
             .exact_height(26.0)
             .frame(
                 egui::Frame::NONE
-                    .fill(SCRIV_TOOLBAR_BG)
+                    .fill(self.theme_toolbar_bg())
                     .inner_margin(egui::Margin::symmetric(10, 2))
-                    .stroke(egui::Stroke::new(1.0_f32, SCRIV_BORDER)),
+                    .stroke(egui::Stroke::new(1.0_f32, self.theme_border())),
             )
             .show(ctx, |ui| {
                 self.render_editor_footer(ui);
@@ -1031,7 +1402,7 @@ impl eframe::App for BookApp {
 
         // 11. Central Writing Canvas
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(SCRIV_CANVAS_BG))
+            .frame(egui::Frame::NONE.fill(self.theme_canvas_bg()))
             .show(ctx, |ui| {
                 self.render_central_pane(ui);
             });
@@ -1079,6 +1450,47 @@ impl BookApp {
             });
 
             ui.menu_button("Edit", |ui| {
+                if ui.button("⚙ Editor Settings...").clicked() {
+                    self.show_editor_settings_modal = true;
+                    ui.close_menu();
+                }
+
+                let mut dark_mode_toggle = self.dark_mode;
+                if ui.checkbox(&mut dark_mode_toggle, if self.dark_mode { "🌙 Dark Mode" } else { "☀ Light Mode" }).changed() {
+                    self.dark_mode = dark_mode_toggle;
+                    self.apply_visuals(ui.ctx());
+                    self.save_settings_config();
+                }
+
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("Editor Profiles")
+                        .size(11.0)
+                        .strong()
+                        .color(self.theme_accent_green()),
+                );
+                let mut switch_profile_opt: Option<String> = None;
+                for prof in &self.profiles {
+                    let is_active = prof.name == self.active_profile_name;
+                    let prefix = if is_active { "✔ " } else { "   " };
+                    let label = format!("{}{}", prefix, prof.name);
+                    if ui.selectable_label(is_active, label).clicked() {
+                        switch_profile_opt = Some(prof.name.clone());
+                        ui.close_menu();
+                    }
+                }
+                if let Some(prof_name) = switch_profile_opt {
+                    self.apply_profile_by_name(&prof_name);
+                }
+
+                if ui.button("➕ New Profile from Current Settings...").clicked() {
+                    self.new_profile_name_input = format!("Custom Profile {}", self.profiles.len() + 1);
+                    self.show_new_profile_modal = true;
+                    ui.close_menu();
+                }
+
+                ui.separator();
+
                 if let Some(doc) = &self.selected_doc {
                     match *doc {
                         SelectedDocument::Scene {
@@ -1161,6 +1573,13 @@ impl BookApp {
                 if ui.button(label).clicked() {
                     self.sidebar_collapsed = !self.sidebar_collapsed;
                     ui.close_menu();
+                }
+                ui.separator();
+                let mut dark_mode_toggle = self.dark_mode;
+                if ui.checkbox(&mut dark_mode_toggle, if self.dark_mode { "🌙 Dark UI Theme" } else { "☀ Light UI Theme" }).changed() {
+                    self.dark_mode = dark_mode_toggle;
+                    self.apply_visuals(ui.ctx());
+                    self.save_settings_config();
                 }
                 ui.separator();
                 if ui.button("Zoom In (125%)").clicked() {
@@ -1356,7 +1775,7 @@ impl BookApp {
                         .strong()
                         .color(egui::Color32::WHITE),
                 )
-                .fill(SCRIV_FOLDER_BLUE)
+                .fill(self.theme_accent_green())
                 .min_size(egui::vec2(104.0, 26.0));
 
                 if ui
@@ -1367,12 +1786,29 @@ impl BookApp {
                     self.compile_pdf();
                 }
 
+                // Dark / Light Mode Switch Button
+                let theme_btn = egui::Button::new(
+                    egui::RichText::new(if self.dark_mode { "☀ Light" } else { "🌙 Dark" })
+                        .size(11.5)
+                        .color(self.theme_text_dark()),
+                )
+                .min_size(egui::vec2(60.0, 26.0));
+                if ui
+                    .add(theme_btn)
+                    .on_hover_text("Toggle Dark / Light Mode")
+                    .clicked()
+                {
+                    self.dark_mode = !self.dark_mode;
+                    self.apply_visuals(ui.ctx());
+                    self.save_settings_config();
+                }
+
                 if self.is_dirty {
                     if ui
                         .button(
                             egui::RichText::new("💾 Save")
                                 .size(11.5)
-                                .color(LEDGER_GREEN_PRIMARY),
+                                .color(self.theme_accent_green()),
                         )
                         .on_hover_text("Save changes now (Ctrl+S)")
                         .clicked()
@@ -1390,14 +1826,14 @@ impl BookApp {
 
         // Top Binder Header ("The Scribe's Ledger" banner)
         egui::Frame::NONE
-            .fill(egui::Color32::from_rgb(232, 238, 234))
+            .fill(self.theme_binder_header_bg())
             .inner_margin(egui::Margin::symmetric(10, 6))
-            .stroke(egui::Stroke::new(0.5_f32, SCRIV_BORDER))
+            .stroke(egui::Stroke::new(0.5_f32, self.theme_border()))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("📐")
-                            .color(SCRIV_FOLDER_BLUE)
+                            .color(self.theme_accent_green())
                             .size(13.0),
                     );
                     let title = self
@@ -1409,7 +1845,7 @@ impl BookApp {
                         egui::RichText::new(title)
                             .strong()
                             .size(12.0)
-                            .color(SCRIV_TEXT_DARK),
+                            .color(self.theme_text_dark()),
                     );
                     if self.project.is_some() {
                         if ui
@@ -1435,7 +1871,7 @@ impl BookApp {
                     egui::RichText::new("📂 Manuscript")
                         .strong()
                         .size(12.5)
-                        .color(SCRIV_TEXT_DARK),
+                        .color(self.theme_text_dark()),
                 )
                 .default_open(true)
                 .id_salt("binder_manuscript_root")
@@ -1471,9 +1907,9 @@ impl BookApp {
                             ))
                             .size(12.0)
                             .color(if is_ch_active {
-                                egui::Color32::from_rgb(20, 75, 42)
+                                self.theme_accent_green()
                             } else {
-                                SCRIV_TEXT_DARK
+                                self.theme_text_dark()
                             });
 
                             let id = ui.make_persistent_id(format!("ch_collapse_{}", chapter.name));
@@ -1667,7 +2103,7 @@ impl BookApp {
                     egui::RichText::new("📑 Front Matter")
                         .strong()
                         .size(12.5)
-                        .color(SCRIV_TEXT_DARK),
+                        .color(self.theme_text_dark()),
                 )
                 .default_open(true)
                 .id_salt("binder_front_matter_root")
@@ -1675,7 +2111,7 @@ impl BookApp {
                     egui::CollapsingHeader::new(
                         egui::RichText::new("📁 Paperback (6\" × 9\")")
                             .size(12.0)
-                            .color(SCRIV_TEXT_DARK),
+                            .color(self.theme_text_dark()),
                     )
                     .default_open(true)
                     .id_salt("binder_paperback_sub")
@@ -1688,7 +2124,7 @@ impl BookApp {
                                 );
 
                                 let row_fill = if is_selected {
-                                    SCRIV_BINDER_SELECTED_BG
+                                    self.theme_binder_selected_bg()
                                 } else {
                                     egui::Color32::TRANSPARENT
                                 };
@@ -1701,7 +2137,7 @@ impl BookApp {
                                         let label = egui::Button::new(
                                             egui::RichText::new(format!("📄 {}", item.title))
                                                 .size(12.0)
-                                                .color(SCRIV_TEXT_DARK),
+                                                .color(self.theme_text_dark()),
                                         )
                                         .frame(false);
                                         if ui.add(label).clicked() {
@@ -1790,7 +2226,7 @@ impl BookApp {
         action: &mut Option<SidebarAction>,
     ) {
         let row_fill = if is_selected {
-            SCRIV_BINDER_SELECTED_BG
+            self.theme_binder_selected_bg()
         } else {
             egui::Color32::TRANSPARENT
         };
@@ -1819,7 +2255,7 @@ impl BookApp {
 
                     let text = egui::RichText::new(format!("📄 {}", scene_title))
                         .size(12.0)
-                        .color(SCRIV_TEXT_DARK);
+                        .color(self.theme_text_dark());
                     let btn = egui::Button::new(if is_selected { text.strong() } else { text })
                         .frame(false)
                         .sense(egui::Sense::click_and_drag());
@@ -2071,7 +2507,7 @@ impl BookApp {
             ui.label(
                 egui::RichText::new(format!("📄 {}", doc_title))
                     .size(12.5)
-                    .color(SCRIV_TEXT_DARK),
+                    .color(self.theme_text_dark()),
             );
 
             // Quick inline rename button for the active scene or chapter
@@ -2119,7 +2555,7 @@ impl BookApp {
                                     ch.title, print_badge
                                 ))
                                 .size(11.0)
-                                .color(SCRIV_TEXT_MUTED),
+                                .color(self.theme_text_muted()),
                             );
                         }
                     }
@@ -2128,13 +2564,14 @@ impl BookApp {
         });
     }
 
-    /// Centered White Paper Sheet with book-like margins, paper shadow, and floating desktop feel.
+    /// Centered Paper Sheet with book-like margins, paper shadow, dynamic profile colors, and floating desktop feel.
     fn render_central_pane(&mut self, ui: &mut egui::Ui) {
         let font_family = self.font_family.to_egui_family();
         let effective_size = self.font_size * (self.zoom_percent as f32 / 100.0);
         let line_spacing = self.line_spacing;
-
         let show_markdown = self.markdown_in_editor;
+        let writing_color = self.current_writing_color();
+
         let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
             highlight_markdown(
                 ui,
@@ -2144,6 +2581,7 @@ impl BookApp {
                 effective_size,
                 line_spacing,
                 show_markdown,
+                writing_color,
             )
         };
 
@@ -2157,19 +2595,38 @@ impl BookApp {
                 let desired_paper_width = 720.0 * (self.zoom_percent as f32 / 100.0);
                 let side_padding = ((total_width - desired_paper_width) * 0.5).max(16.0);
 
+                let page_color = self.current_page_color();
+                let lum_page = (page_color.r() as u32 * 299 + page_color.g() as u32 * 587 + page_color.b() as u32 * 114) / 1000;
+                let is_dark_paper = lum_page < 128;
+                let paper_stroke = if is_dark_paper {
+                    egui::Color32::from_rgb(52, 64, 56)
+                } else {
+                    egui::Color32::from_rgb(220, 226, 222)
+                };
+                let paper_shadow = if is_dark_paper {
+                    egui::epaint::Shadow {
+                        offset: [0, 2],
+                        blur: 8,
+                        spread: 1,
+                        color: egui::Color32::from_black_alpha(55),
+                    }
+                } else {
+                    egui::epaint::Shadow {
+                        offset: [0, 2],
+                        blur: 6,
+                        spread: 1,
+                        color: egui::Color32::from_black_alpha(12),
+                    }
+                };
+
                 ui.horizontal(|ui| {
                     ui.add_space(side_padding);
 
                     egui::Frame::NONE
-                        .fill(SCRIV_PAPER_BG)
+                        .fill(page_color)
                         .inner_margin(egui::Margin::symmetric(48, 32))
-                        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(220, 226, 222)))
-                        .shadow(egui::epaint::Shadow {
-                            offset: [0, 2],
-                            blur: 6,
-                            spread: 1,
-                            color: egui::Color32::from_black_alpha(12),
-                        })
+                        .stroke(egui::Stroke::new(1.0_f32, paper_stroke))
+                        .shadow(paper_shadow)
                         .show(ui, |ui| {
                             let paper_inner_width =
                                 (total_width - side_padding * 2.0 - 96.0).max(260.0);
@@ -2224,7 +2681,7 @@ impl BookApp {
                     format_number_with_commas(self.cached_word_count)
                 ))
                 .size(11.5)
-                .color(SCRIV_TEXT_DARK),
+                .color(self.theme_text_dark()),
             );
 
             // Right: Save status indicator
@@ -2239,7 +2696,7 @@ impl BookApp {
                     ui.label(
                         egui::RichText::new("✓ Saved")
                             .size(11.0)
-                            .color(SCRIV_TEXT_MUTED),
+                            .color(self.theme_text_muted()),
                     );
                 }
             });
@@ -2736,26 +3193,408 @@ impl BookApp {
                 self.show_scrivener_import_modal = false;
             }
         }
+
+        // 7. Editor Settings & Profiles Modal
+        self.render_editor_settings_modal(ctx);
+
+        // 8. Save New Profile Modal
+        self.render_new_profile_modal(ctx);
+    }
+
+    /// Renders the comprehensive Editor Settings & Profiles configuration dialog.
+    fn render_editor_settings_modal(&mut self, ctx: &egui::Context) {
+        if !self.show_editor_settings_modal {
+            return;
+        }
+
+        let mut close_modal = false;
+        let mut open_new_profile = false;
+
+        egui::Window::new("⚙ Editor Settings & Profiles")
+            .collapsible(false)
+            .resizable(true)
+            .default_size([580.0, 520.0])
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.y = 8.0;
+
+                // 1. Profile Selector Row
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Active Profile:").strong());
+
+                    let current_selection = self.active_profile_name.clone();
+                    let mut switch_to_profile: Option<String> = None;
+                    egui::ComboBox::from_id_salt("editor_settings_profile_combo")
+                        .selected_text(&current_selection)
+                        .width(200.0)
+                        .show_ui(ui, |ui| {
+                            for prof in &self.profiles {
+                                let is_selected = prof.name == current_selection;
+                                if ui.selectable_label(is_selected, &prof.name).clicked() {
+                                    switch_to_profile = Some(prof.name.clone());
+                                }
+                            }
+                        });
+                    if let Some(name) = switch_to_profile {
+                        self.apply_profile_by_name(&name);
+                    }
+
+                    if ui
+                        .button("➕ New Profile...")
+                        .on_hover_text("Create a new profile from current settings")
+                        .clicked()
+                    {
+                        open_new_profile = true;
+                    }
+
+                    if let Some(prof) = self.active_profile() {
+                        if !prof.is_builtin {
+                            if ui
+                                .button(
+                                    egui::RichText::new("🗑 Delete")
+                                        .color(egui::Color32::from_rgb(200, 60, 60)),
+                                )
+                                .clicked()
+                            {
+                                let to_delete = prof.name.clone();
+                                self.profiles.retain(|p| p.name != to_delete);
+                                if let Some(first) = self.profiles.first().cloned() {
+                                    self.apply_profile_by_name(&first.name);
+                                }
+                            }
+                        }
+                    }
+                });
+
+                ui.separator();
+
+                // 2. Page Color & Writing Color Pickers
+                ui.columns(2, |columns| {
+                    // Left Column: Page Color
+                    columns[0].vertical(|ui| {
+                        ui.label(egui::RichText::new("📄 Page Color").strong());
+
+                        let mut current_page = if let Some(prof) = self.active_profile() {
+                            prof.page_color
+                        } else {
+                            [255, 255, 255]
+                        };
+
+                        ui.horizontal(|ui| {
+                            ui.label("Custom:");
+                            if ui.color_edit_button_srgb(&mut current_page).changed() {
+                                if let Some(prof) = self.active_profile_mut() {
+                                    prof.page_color = current_page;
+                                }
+                            }
+                        });
+
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("Swatches:").weak().size(11.0));
+                        ui.horizontal_wrapped(|ui| {
+                            let presets = [
+                                ("White", [255, 255, 255]),
+                                ("Ivory", [250, 246, 238]),
+                                ("Sepia", [244, 236, 216]),
+                                ("Slate", [34, 38, 36]),
+                                ("Obsidian", [22, 25, 24]),
+                                ("Dark Green", [18, 22, 20]),
+                            ];
+                            for (pname, rgb) in presets {
+                                let btn = egui::Button::new(
+                                    egui::RichText::new(format!("■ {}", pname))
+                                        .color(egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2])),
+                                );
+                                if ui.add(btn).clicked() {
+                                    if let Some(prof) = self.active_profile_mut() {
+                                        prof.page_color = rgb;
+                                    }
+                                }
+                            }
+                        });
+                    });
+
+                    // Right Column: Writing Color
+                    columns[1].vertical(|ui| {
+                        ui.label(egui::RichText::new("✏ Writing Color").strong());
+
+                        let mut current_writing = if let Some(prof) = self.active_profile() {
+                            prof.writing_color
+                        } else {
+                            [30, 36, 32]
+                        };
+
+                        ui.horizontal(|ui| {
+                            ui.label("Custom:");
+                            if ui.color_edit_button_srgb(&mut current_writing).changed() {
+                                if let Some(prof) = self.active_profile_mut() {
+                                    prof.writing_color = current_writing;
+                                }
+                            }
+                        });
+
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("Swatches:").weak().size(11.0));
+                        ui.horizontal_wrapped(|ui| {
+                            let presets = [
+                                ("Charcoal", [30, 36, 32]),
+                                ("Espresso", [42, 36, 33]),
+                                ("Walnut", [62, 39, 35]),
+                                ("Pale Sage", [226, 236, 229]),
+                                ("Silver", [216, 226, 220]),
+                                ("Phosphor", [74, 222, 128]),
+                            ];
+                            for (pname, rgb) in presets {
+                                let btn = egui::Button::new(
+                                    egui::RichText::new(format!("■ {}", pname))
+                                        .color(egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2])),
+                                );
+                                if ui.add(btn).clicked() {
+                                    if let Some(prof) = self.active_profile_mut() {
+                                        prof.writing_color = rgb;
+                                    }
+                                }
+                            }
+                        });
+                    });
+                });
+
+                ui.separator();
+
+                // 3. Typography: Font Family, Font Size, Line Spacing
+                ui.label(egui::RichText::new("🔤 Typography").strong());
+                ui.horizontal(|ui| {
+                    ui.label("Font Family:");
+                    egui::ComboBox::from_id_salt("editor_settings_font_combo")
+                        .selected_text(self.font_family.name())
+                        .width(140.0)
+                        .show_ui(ui, |ui| {
+                            let mut changed = false;
+                            if ui
+                                .selectable_value(
+                                    &mut self.font_family,
+                                    FontFamilyChoice::Serif,
+                                    "Sitka Text (Serif)",
+                                )
+                                .clicked()
+                            {
+                                changed = true;
+                            }
+                            if ui
+                                .selectable_value(
+                                    &mut self.font_family,
+                                    FontFamilyChoice::Proportional,
+                                    "Segoe UI (Sans)",
+                                )
+                                .clicked()
+                            {
+                                changed = true;
+                            }
+                            if ui
+                                .selectable_value(
+                                    &mut self.font_family,
+                                    FontFamilyChoice::Monospace,
+                                    "Consolas (Mono)",
+                                )
+                                .clicked()
+                            {
+                                changed = true;
+                            }
+                            if changed {
+                                let fam = self.font_family;
+                                if let Some(prof) = self.active_profile_mut() {
+                                    prof.font_family = fam;
+                                }
+                            }
+                        });
+
+                    ui.add_space(10.0);
+                    ui.label("Font Size:");
+                    let mut sz = self.font_size;
+                    if ui
+                        .add(egui::Slider::new(&mut sz, 10.0..=32.0).step_by(1.0).suffix(" pt"))
+                        .changed()
+                    {
+                        self.font_size = sz;
+                        if let Some(prof) = self.active_profile_mut() {
+                            prof.font_size = sz;
+                        }
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Line Spacing:");
+                    let mut ls = self.line_spacing;
+                    if ui
+                        .add(egui::Slider::new(&mut ls, 1.0..=2.0).step_by(0.05).suffix("x"))
+                        .changed()
+                    {
+                        self.line_spacing = ls;
+                        if let Some(prof) = self.active_profile_mut() {
+                            prof.line_spacing = ls;
+                        }
+                    }
+
+                    ui.add_space(8.0);
+                    for preset_sz in [12.0, 14.0, 15.0, 16.0, 18.0] {
+                        if ui
+                            .selectable_label(
+                                self.font_size == preset_sz,
+                                format!("{}pt", preset_sz as u32),
+                            )
+                            .clicked()
+                        {
+                            self.font_size = preset_sz;
+                            if let Some(prof) = self.active_profile_mut() {
+                                prof.font_size = preset_sz;
+                            }
+                        }
+                    }
+                });
+
+                ui.separator();
+
+                // 4. Live Manuscript Paper Preview
+                ui.label(egui::RichText::new("👁 Live Paper Preview").strong());
+                let preview_page = self.current_page_color();
+                let preview_text = self.current_writing_color();
+                let preview_family = self.font_family.to_egui_family();
+                let preview_font_size = self.font_size.clamp(11.0, 18.0);
+
+                egui::Frame::NONE
+                    .fill(preview_page)
+                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(180, 190, 184)))
+                    .corner_radius(3.0)
+                    .inner_margin(egui::Margin::symmetric(16, 12))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+
+                        let lum = (preview_text.r() as u32 * 299
+                            + preview_text.g() as u32 * 587
+                            + preview_text.b() as u32 * 114)
+                            / 1000;
+                        let heading_color = if lum > 140 {
+                            egui::Color32::from_rgb(74, 222, 128)
+                        } else {
+                            egui::Color32::from_rgb(22, 78, 45)
+                        };
+
+                        ui.label(
+                            egui::RichText::new("Chapter 1: The Scribe's Ledger")
+                                .font(egui::FontId::new(
+                                    preview_font_size * 1.25,
+                                    preview_family.clone(),
+                                ))
+                                .color(heading_color)
+                                .strong(),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "The ink dried slowly upon the parchment. Every stroke was sharp, deliberate, and clear. Words woven with bold conviction and italic grace.",
+                            )
+                            .font(egui::FontId::new(preview_font_size, preview_family))
+                            .color(preview_text),
+                        );
+                    });
+
+                ui.separator();
+
+                // 5. Bottom Dialog Action Buttons
+                ui.horizontal(|ui| {
+                    if ui.button("✔ Done").clicked() {
+                        close_modal = true;
+                    }
+
+                    if ui
+                        .button("Reset Built-in Presets")
+                        .on_hover_text("Restore default built-in profiles")
+                        .clicked()
+                    {
+                        let default_conf = EditorSettingsConfig::default();
+                        for def_p in default_conf.profiles {
+                            if let Some(existing) =
+                                self.profiles.iter_mut().find(|p| p.name == def_p.name)
+                            {
+                                *existing = def_p;
+                            } else {
+                                self.profiles.push(def_p);
+                            }
+                        }
+                        if let Some(active) = self.active_profile().cloned() {
+                            self.font_family = active.font_family;
+                            self.font_size = active.font_size;
+                            self.line_spacing = active.line_spacing;
+                        }
+                        self.save_settings_config();
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let mut dark_mode = self.dark_mode;
+                        if ui.checkbox(&mut dark_mode, "🌙 Dark UI Theme").changed() {
+                            self.dark_mode = dark_mode;
+                            self.apply_visuals(ui.ctx());
+                            self.save_settings_config();
+                        }
+                    });
+                });
+            });
+
+        if open_new_profile {
+            self.new_profile_name_input =
+                format!("Custom Profile {}", self.profiles.len() + 1);
+            self.show_new_profile_modal = true;
+        }
+        if close_modal {
+            self.save_settings_config();
+            self.show_editor_settings_modal = false;
+        }
+    }
+
+    /// Renders the small modal dialog for creating and naming a new custom profile.
+    fn render_new_profile_modal(&mut self, ctx: &egui::Context) {
+        if !self.show_new_profile_modal {
+            return;
+        }
+
+        let mut close = false;
+        let mut create = false;
+
+        egui::Window::new("Save New Editor Profile")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.y = 8.0;
+                ui.label("Enter a name for your new editor profile:");
+                ui.text_edit_singleline(&mut self.new_profile_name_input);
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Create Profile").clicked() {
+                        create = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        if create {
+            let name = self.new_profile_name_input.trim().to_string();
+            if !name.is_empty() {
+                self.create_profile_from_current(name);
+            }
+            close = true;
+        }
+        if close {
+            self.show_new_profile_modal = false;
+        }
     }
 }
 
-/// Configures Scrivener 3's signature crisp light theme and loads Windows Serif fonts (Sitka / Georgia).
-fn configure_scrivener_theme_and_fonts(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::light();
-    visuals.panel_fill = SCRIV_CANVAS_BG;
-    visuals.window_fill = egui::Color32::from_rgb(248, 250, 248);
-    visuals.faint_bg_color = SCRIV_BINDER_BG;
-    visuals.extreme_bg_color = egui::Color32::WHITE;
-    visuals.selection.bg_fill = egui::Color32::from_rgb(205, 226, 212);
-    visuals.selection.stroke = egui::Stroke::new(1.0_f32, SCRIV_TEXT_DARK);
-    visuals.widgets.noninteractive.fg_stroke.color = SCRIV_TEXT_DARK;
-    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(252, 253, 252);
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, SCRIV_BORDER);
-    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(234, 242, 236);
-    visuals.widgets.active.bg_fill = SCRIV_BINDER_SELECTED_BG;
-    ctx.set_visuals(visuals);
-
-    // Load Windows system Serif font (Georgia or Times New Roman) for literary Sitka/Serif manuscript feel
+/// Loads Windows system Serif font (Georgia or Times New Roman) for literary Sitka/Serif manuscript feel.
+fn load_system_serif_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let serif_candidates = [
         r"C:\Windows\Fonts\georgia.ttf",
@@ -2819,15 +3658,38 @@ fn highlight_markdown(
     base_size: f32,
     line_spacing: f32,
     show_markdown: bool,
+    writing_color: egui::Color32,
 ) -> std::sync::Arc<egui::Galley> {
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = wrap_width;
 
-    let text_color = SCRIV_TEXT_DARK;
-    let weak_color = egui::Color32::from_rgb(140, 158, 146);
-    let heading_color = egui::Color32::from_rgb(22, 78, 45); // Deep rich bookbinder green for #, ##, ###
-    let bold_color = egui::Color32::from_rgb(18, 24, 20);
-    let italic_color = egui::Color32::from_rgb(45, 55, 48);
+    let lum = (writing_color.r() as u32 * 299
+        + writing_color.g() as u32 * 587
+        + writing_color.b() as u32 * 114)
+        / 1000;
+    let is_light_text = lum > 140;
+
+    let text_color = writing_color;
+    let weak_color = if is_light_text {
+        egui::Color32::from_rgb(
+            (writing_color.r() as f32 * 0.65) as u8,
+            (writing_color.g() as f32 * 0.65) as u8,
+            (writing_color.b() as f32 * 0.65) as u8,
+        )
+    } else {
+        egui::Color32::from_rgb(140, 158, 146)
+    };
+    let heading_color = if is_light_text {
+        egui::Color32::from_rgb(74, 222, 128)
+    } else {
+        egui::Color32::from_rgb(22, 78, 45)
+    };
+    let bold_color = if is_light_text {
+        egui::Color32::WHITE
+    } else {
+        egui::Color32::from_rgb(18, 24, 20)
+    };
+    let italic_color = text_color;
 
     let extra_letter_spacing = if line_spacing > 1.05 { 0.1 } else { 0.0 };
 
@@ -3255,6 +4117,7 @@ mod tests {
                     14.0,
                     1.0,
                     true,
+                    SCRIV_TEXT_DARK,
                 );
                 assert!(galley_with_md.size().x > 0.0);
 
@@ -3267,6 +4130,7 @@ mod tests {
                     14.0,
                     1.0,
                     false,
+                    SCRIV_TEXT_DARK,
                 );
                 assert!(galley_hidden_md.size().x > 0.0);
             });
@@ -3300,5 +4164,44 @@ mod tests {
         assert_eq!(p.chapters[1].name, original_third);
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_editor_profiles_and_settings_config() {
+        let config = EditorSettingsConfig::default();
+        assert!(!config.dark_mode);
+        assert_eq!(config.active_profile, "Default Ledger");
+        assert_eq!(config.profiles.len(), 6);
+
+        // Serialize and deserialize toml
+        let toml_str = toml::to_string(&config).expect("serialize config to toml");
+        let deserialized: EditorSettingsConfig = toml::from_str(&toml_str).expect("deserialize config");
+        assert_eq!(deserialized.active_profile, "Default Ledger");
+        assert_eq!(deserialized.profiles.len(), 6);
+
+        let mut app = BookApp::default();
+        assert_eq!(app.active_profile_name, "Default Ledger");
+        assert_eq!(app.current_page_color(), egui::Color32::from_rgb(255, 255, 255));
+
+        // Switch to Night Scribe profile
+        app.apply_profile_by_name("Night Scribe");
+        assert_eq!(app.active_profile_name, "Night Scribe");
+        assert_eq!(app.current_page_color(), egui::Color32::from_rgb(34, 38, 36));
+        assert_eq!(app.current_writing_color(), egui::Color32::from_rgb(226, 236, 229));
+
+        // Create a custom profile
+        app.font_size = 18.0;
+        app.create_profile_from_current("My Fantasy".to_string());
+        assert_eq!(app.active_profile_name, "My Fantasy");
+        assert_eq!(app.font_size, 18.0);
+        let custom_prof = app.active_profile().expect("active custom profile");
+        assert_eq!(custom_prof.name, "My Fantasy");
+        assert!(!custom_prof.is_builtin);
+
+        // Toggle dark mode
+        assert!(!app.is_dark_mode());
+        app.dark_mode = true;
+        assert!(app.is_dark_mode());
+        assert_eq!(app.theme_menu_bar_bg(), egui::Color32::from_rgb(26, 32, 28));
     }
 }

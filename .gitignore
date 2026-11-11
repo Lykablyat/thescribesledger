@@ -19,6 +19,9 @@ The Scribes Ledger.exe
 *.log
 *.tmp
 
+# User settings and profiles
+editor_settings.toml
+
 # Local user projects and imported workspaces
 novel_project/
 *_ScribesLedger/
