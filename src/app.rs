@@ -1,20 +1,16 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Instant;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
-use crate::compile::compile_book_to_pdf;
-use crate::compiler::compile_to_pdf;
+use crate::compile::compile_book_to_pdf_with_options;
+use crate::compiler::{compile_to_pdf_with_options, CompileOptions};
+pub use crate::fonts::{
+    import_ttf_font, register_egui_fonts, FontCategory, FontFamilyChoice, ImportedFont,
+};
 use crate::project::{BookProject, ChapterKind};
+use crate::find_replace::{apply_search_highlights_to_job, FindMatch, FindScope};
 use crate::scrivener::ScrivenerImporter;
-
-/// Font family choices available in the format bar and editor profiles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum FontFamilyChoice {
-    Serif,
-    Proportional,
-    Monospace,
-}
 
 /// A customizable styling profile for the central writing canvas.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -29,7 +25,7 @@ pub struct EditorProfile {
     pub line_spacing: f32,
 }
 
-/// Persisted configuration for application theme and editor styling profiles.
+/// Persisted configuration for application theme, imported fonts, and editor styling profiles.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EditorSettingsConfig {
     #[serde(default)]
@@ -38,6 +34,8 @@ pub struct EditorSettingsConfig {
     pub active_profile: String,
     #[serde(default = "default_profiles")]
     pub profiles: Vec<EditorProfile>,
+    #[serde(default)]
+    pub imported_fonts: Vec<ImportedFont>,
 }
 
 fn default_active_profile() -> String {
@@ -109,6 +107,7 @@ impl Default for EditorSettingsConfig {
             dark_mode: false,
             active_profile: default_active_profile(),
             profiles: default_profiles(),
+            imported_fonts: Vec::new(),
         }
     }
 }
@@ -141,24 +140,6 @@ impl EditorSettingsConfig {
         let path = Self::config_path();
         if let Ok(content) = toml::to_string_pretty(self) {
             let _ = std::fs::write(path, content);
-        }
-    }
-}
-
-impl FontFamilyChoice {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Serif => "Sitka Text",
-            Self::Proportional => "Segoe UI",
-            Self::Monospace => "Consolas",
-        }
-    }
-
-    pub fn to_egui_family(&self) -> egui::FontFamily {
-        match self {
-            Self::Serif => egui::FontFamily::Name("Serif".into()),
-            Self::Proportional => egui::FontFamily::Proportional,
-            Self::Monospace => egui::FontFamily::Monospace,
         }
     }
 }
@@ -295,13 +276,39 @@ pub struct BookApp {
     // Editor formatting display toggle
     pub markdown_in_editor: bool,
 
-    // Dark mode and editor profiles
+    // Dark mode, imported fonts, and editor profiles
     pub dark_mode: bool,
+    pub skip_settings_save: bool,
     pub active_profile_name: String,
     pub profiles: Vec<EditorProfile>,
+    pub imported_fonts: Vec<ImportedFont>,
+    pub registered_font_families: HashSet<String>,
     pub show_editor_settings_modal: bool,
     pub show_new_profile_modal: bool,
     pub new_profile_name_input: String,
+
+    // Compile PDF options modal
+    pub show_compile_modal: bool,
+    pub compile_use_custom_style: bool,
+    pub compile_font_family: FontFamilyChoice,
+    pub compile_font_size: f32,
+    pub compile_text_color: [u8; 3],
+    pub compile_page_color: [u8; 3],
+
+    // Find & Change Findings pop-up state
+    pub show_find_popup: bool,
+    pub find_focus_requested: bool,
+    pub find_scope: FindScope,
+    pub find_query: String,
+    pub find_case_sensitive: bool,
+    pub find_change_enabled: bool,
+    pub find_replace_text: String,
+    pub find_matches: Vec<FindMatch>,
+    pub find_current_idx: usize,
+    pub show_replace_confirm_modal: bool,
+    pub pending_replace_all_count: usize,
+    pub find_scroll_to_match: bool,
+    pub central_pane_rect: Option<egui::Rect>,
 }
 
 impl Default for BookApp {
@@ -347,11 +354,33 @@ impl Default for BookApp {
             delete_target: None,
             markdown_in_editor: true,
             dark_mode: false,
+            skip_settings_save: false,
             active_profile_name: "Default Ledger".to_string(),
             profiles: default_profiles(),
+            imported_fonts: Vec::new(),
+            registered_font_families: HashSet::new(),
             show_editor_settings_modal: false,
             show_new_profile_modal: false,
             new_profile_name_input: "My Custom Profile".to_string(),
+            show_compile_modal: false,
+            compile_use_custom_style: false,
+            compile_font_family: FontFamilyChoice::Serif,
+            compile_font_size: 10.5,
+            compile_text_color: [0, 0, 0],
+            compile_page_color: [255, 255, 255],
+            show_find_popup: false,
+            find_focus_requested: false,
+            find_scope: FindScope::Scene,
+            find_query: String::new(),
+            find_case_sensitive: false,
+            find_change_enabled: false,
+            find_replace_text: String::new(),
+            find_matches: Vec::new(),
+            find_current_idx: 0,
+            show_replace_confirm_modal: false,
+            pending_replace_all_count: 0,
+            find_scroll_to_match: false,
+            central_pane_rect: None,
         }
     }
 }
@@ -362,9 +391,10 @@ impl BookApp {
         let loaded_config = EditorSettingsConfig::load_or_default();
         app.dark_mode = loaded_config.dark_mode;
         app.profiles = loaded_config.profiles;
+        app.imported_fonts = loaded_config.imported_fonts;
         app.apply_profile_by_name(&loaded_config.active_profile);
 
-        load_system_serif_fonts(&cc.egui_ctx);
+        app.registered_font_families = register_egui_fonts(&cc.egui_ctx, &app.imported_fonts);
         app.apply_visuals(&cc.egui_ctx);
 
         // Check if an existing project is in current directory or a default location
@@ -385,7 +415,7 @@ impl BookApp {
     }
 
     #[inline]
-    fn recompute_word_count(&mut self) {
+    pub(crate) fn recompute_word_count(&mut self) {
         self.cached_word_count = self.editor_content.split_whitespace().count();
     }
 
@@ -423,6 +453,100 @@ impl BookApp {
         }
     }
 
+    pub fn imported_fonts_dir() -> PathBuf {
+        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        current_dir.join("imported_fonts")
+    }
+
+    pub fn all_font_choices(&self) -> Vec<FontFamilyChoice> {
+        let mut list: Vec<FontFamilyChoice> = FontFamilyChoice::builtin_choices().to_vec();
+        for imp in &self.imported_fonts {
+            list.push(FontFamilyChoice::Custom(imp.name.clone()));
+        }
+        list
+    }
+
+    pub fn import_ttf_font_from_path(
+        &mut self,
+        source_path: &Path,
+        storage_dir: &Path,
+        ctx: Option<&egui::Context>,
+        select_in_editor: bool,
+    ) -> Result<ImportedFont, String> {
+        let imported = import_ttf_font(source_path, storage_dir, &self.imported_fonts)
+            .map_err(|e| e.to_string())?;
+        self.imported_fonts.push(imported.clone());
+
+        if let Some(c) = ctx {
+            self.registered_font_families = register_egui_fonts(c, &self.imported_fonts);
+        }
+
+        if select_in_editor {
+            let choice = FontFamilyChoice::Custom(imported.name.clone());
+            self.font_family = choice.clone();
+            if let Some(prof) = self.active_profile_mut() {
+                prof.font_family = choice;
+            }
+        }
+
+        self.save_settings_config();
+        self.set_status(format!("Imported TTF font '{}'", imported.name));
+        Ok(imported)
+    }
+
+    pub fn pick_and_import_ttf_font(
+        &mut self,
+        ctx: &egui::Context,
+        select_in_editor: bool,
+    ) -> Option<FontFamilyChoice> {
+        let file = rfd::FileDialog::new()
+            .set_title("Import TrueType Font (.ttf)")
+            .add_filter("TrueType Font (*.ttf)", &["ttf"])
+            .pick_file()?;
+
+        match self.import_ttf_font_from_path(
+            &file,
+            &Self::imported_fonts_dir(),
+            Some(ctx),
+            select_in_editor,
+        ) {
+            Ok(imp) => Some(FontFamilyChoice::Custom(imp.name)),
+            Err(err) => {
+                self.set_status(format!("Font import failed: {}", err));
+                None
+            }
+        }
+    }
+
+    pub fn remove_imported_font(&mut self, name: &str, ctx: Option<&egui::Context>) {
+        if let Some(pos) = self.imported_fonts.iter().position(|f| f.name == name) {
+            let removed = self.imported_fonts.remove(pos);
+            let fonts_dir = Self::imported_fonts_dir();
+            if removed.path.starts_with(&fonts_dir) {
+                let _ = std::fs::remove_file(&removed.path);
+            }
+        }
+
+        let target = FontFamilyChoice::Custom(name.to_string());
+        if self.font_family == target {
+            self.font_family = FontFamilyChoice::Serif;
+        }
+        if self.compile_font_family == target {
+            self.compile_font_family = FontFamilyChoice::Serif;
+        }
+        for prof in &mut self.profiles {
+            if prof.font_family == target {
+                prof.font_family = FontFamilyChoice::Serif;
+            }
+        }
+
+        if let Some(c) = ctx {
+            self.registered_font_families = register_egui_fonts(c, &self.imported_fonts);
+        }
+        self.save_settings_config();
+        self.set_status(format!("Removed imported font '{}'", name));
+    }
+
     pub fn apply_profile_by_name(&mut self, name: &str) {
         if let Some(prof) = self.profiles.iter().find(|p| p.name == name).cloned() {
             self.active_profile_name = prof.name.clone();
@@ -445,7 +569,7 @@ impl BookApp {
             is_builtin: false,
             page_color: [current_page.r(), current_page.g(), current_page.b()],
             writing_color: [current_text.r(), current_text.g(), current_text.b()],
-            font_family: self.font_family,
+            font_family: self.font_family.clone(),
             font_size: self.font_size,
             line_spacing: self.line_spacing,
         };
@@ -459,10 +583,14 @@ impl BookApp {
     }
 
     pub fn save_settings_config(&self) {
+        if self.skip_settings_save {
+            return;
+        }
         let config = EditorSettingsConfig {
             dark_mode: self.dark_mode,
             active_profile: self.active_profile_name.clone(),
             profiles: self.profiles.clone(),
+            imported_fonts: self.imported_fonts.clone(),
         };
         config.save();
     }
@@ -679,6 +807,7 @@ impl BookApp {
         self.project = Some(project);
         self.nav_history.clear();
         self.nav_history_pos = 0;
+        self.show_replace_confirm_modal = false;
 
         if let Some(p) = &self.project {
             if !p.chapters.is_empty() && !p.chapters[0].scenes.is_empty() {
@@ -770,6 +899,9 @@ impl BookApp {
             }
             self.is_dirty = false;
             self.last_edit_time = None;
+            if self.show_find_popup {
+                self.refresh_find_matches();
+            }
         }
     }
 
@@ -806,6 +938,9 @@ impl BookApp {
             }
             self.is_dirty = false;
             self.last_edit_time = None;
+            if self.show_find_popup {
+                self.refresh_find_matches();
+            }
         }
     }
 
@@ -994,12 +1129,51 @@ impl BookApp {
         }
     }
 
+    pub fn open_compile_modal(&mut self) {
+        self.save_current_file_if_dirty();
+        if self.project.is_none() {
+            self.set_status("No project loaded to compile");
+            return;
+        }
+        self.show_compile_modal = true;
+    }
+
+    pub fn build_compile_options(&self) -> CompileOptions {
+        let mut dirs = Vec::new();
+        let default_dir = Self::imported_fonts_dir();
+        if default_dir.exists() {
+            dirs.push(default_dir);
+        }
+        for imp in &self.imported_fonts {
+            if let Some(parent) = imp.path.parent() {
+                let pb = parent.to_path_buf();
+                if pb.exists() && !dirs.contains(&pb) {
+                    dirs.push(pb);
+                }
+            }
+        }
+
+        CompileOptions {
+            use_custom_style: self.compile_use_custom_style,
+            font_family: self.compile_font_family.clone(),
+            font_size: self.compile_font_size,
+            text_color: self.compile_text_color,
+            page_color: self.compile_page_color,
+            imported_fonts: self.imported_fonts.clone(),
+            custom_font_dirs: dirs,
+        }
+    }
+
     pub fn compile_pdf(&mut self) {
+        self.open_compile_modal();
+    }
+
+    pub fn execute_compile_pdf(&mut self) -> bool {
         self.save_current_file_if_dirty();
 
         let Some(p) = &self.project else {
             self.set_status("No project loaded to compile");
-            return;
+            return false;
         };
 
         let default_name = format!("{}.pdf", sanitize_filename(&p.title));
@@ -1009,10 +1183,11 @@ impl BookApp {
             .set_file_name(&default_name);
 
         if let Some(save_path) = dialog.save_file() {
+            let options = self.build_compile_options();
             if let Some(p) = &self.project {
-                let result = compile_to_pdf(p, &save_path)
+                let result = compile_to_pdf_with_options(p, &save_path, &options)
                     .map(|_| ())
-                    .or_else(|_err| compile_book_to_pdf(p, &save_path));
+                    .or_else(|_err| compile_book_to_pdf_with_options(p, &save_path, &options));
 
                 match result {
                     Ok(()) => {
@@ -1020,6 +1195,7 @@ impl BookApp {
                             "Compiled 6x9 PDF to {:?}",
                             save_path.file_name().unwrap_or_default()
                         ));
+                        return true;
                     }
                     Err(e) => {
                         self.set_status(format!("PDF compilation failed: {}", e));
@@ -1027,6 +1203,7 @@ impl BookApp {
                 }
             }
         }
+        false
     }
 
     pub fn open_project_dialog(&mut self) {
@@ -1245,6 +1422,74 @@ impl BookApp {
         self.is_dirty = true;
         self.last_edit_time = Some(Instant::now());
     }
+
+    /// Handles global keyboard shortcuts (Ctrl+B/I/U/S, Ctrl+F / F3 for Find, Escape).
+    pub fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        let (
+            trigger_bold,
+            trigger_italic,
+            trigger_underline,
+            trigger_save,
+            trigger_find_ctrl,
+            trigger_find_f3,
+            trigger_escape,
+        ) = ctx.input_mut(|i| {
+            let b = i.consume_key(egui::Modifiers::COMMAND, egui::Key::B)
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::B);
+            let it = i.consume_key(egui::Modifiers::COMMAND, egui::Key::I)
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::I);
+            let u = i.consume_key(egui::Modifiers::COMMAND, egui::Key::U)
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::U);
+            let s = i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::S);
+            let fc = i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::F);
+            let f3 = i.consume_key(egui::Modifiers::NONE, egui::Key::F3);
+            let esc = if self.show_replace_confirm_modal || self.show_find_popup || self.show_compile_modal {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+            } else {
+                false
+            };
+            (b, it, u, s, fc, f3, esc)
+        });
+
+        if trigger_bold {
+            self.is_bold = !self.is_bold;
+            self.apply_format_wrapper(ctx, "**", "**");
+        }
+        if trigger_italic {
+            self.is_italic = !self.is_italic;
+            self.apply_format_wrapper(ctx, "*", "*");
+        }
+        if trigger_underline {
+            self.is_underline = !self.is_underline;
+            self.apply_format_wrapper(ctx, "<u>", "</u>");
+        }
+        if trigger_save {
+            self.save_current_file();
+        }
+        if trigger_find_ctrl {
+            self.open_find_popup();
+        }
+        if trigger_find_f3 {
+            if !self.show_find_popup {
+                self.open_find_popup();
+            } else if !self.find_matches.is_empty() {
+                self.find_next_match(ctx);
+            } else {
+                self.find_focus_requested = true;
+            }
+        }
+        if trigger_escape {
+            if self.show_replace_confirm_modal {
+                self.show_replace_confirm_modal = false;
+            } else if self.show_compile_modal {
+                self.show_compile_modal = false;
+            } else if self.show_find_popup {
+                self.show_find_popup = false;
+            }
+        }
+    }
 }
 
 impl Drop for BookApp {
@@ -1259,37 +1504,8 @@ impl eframe::App for BookApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 1. Keyboard shortcuts: Ctrl+B (Bold), Ctrl+I (Italic), Ctrl+U (Underline), Ctrl+S (Save)
-        let (trigger_bold, trigger_italic, trigger_underline, trigger_save) = ctx.input_mut(|i| {
-            let b = i.consume_key(egui::Modifiers::COMMAND, egui::Key::B)
-                || i.consume_key(egui::Modifiers::CTRL, egui::Key::B);
-            let it = i.consume_key(egui::Modifiers::COMMAND, egui::Key::I)
-                || i.consume_key(egui::Modifiers::CTRL, egui::Key::I);
-            let u = i.consume_key(egui::Modifiers::COMMAND, egui::Key::U)
-                || i.consume_key(egui::Modifiers::CTRL, egui::Key::U);
-            let s = i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)
-                || i.consume_key(egui::Modifiers::CTRL, egui::Key::S);
-            (b, it, u, s)
-        });
-
-        if trigger_bold {
-            self.is_bold = !self.is_bold;
-            self.apply_format_wrapper(ctx, "**", "**");
-        }
-
-        if trigger_italic {
-            self.is_italic = !self.is_italic;
-            self.apply_format_wrapper(ctx, "*", "*");
-        }
-
-        if trigger_underline {
-            self.is_underline = !self.is_underline;
-            self.apply_format_wrapper(ctx, "<u>", "</u>");
-        }
-
-        if trigger_save {
-            self.save_current_file();
-        }
+        // 1. Keyboard shortcuts: Ctrl+B/I/U/S, Ctrl+F / F3 (Find), Escape
+        self.handle_shortcuts(ctx);
 
         // 2. Auto-save on window close request
         if ctx.input(|i| i.viewport().close_requested()) {
@@ -1406,6 +1622,9 @@ impl eframe::App for BookApp {
             .show(ctx, |ui| {
                 self.render_central_pane(ui);
             });
+
+        // 12. Floating Find & Change Findings pop-up on top-left of the page panel
+        self.render_find_popup(ctx);
     }
 
     fn save(&mut self, _storage: &mut dyn eframe::Storage) {
@@ -1450,6 +1669,12 @@ impl BookApp {
             });
 
             ui.menu_button("Edit", |ui| {
+                if ui.button("🔍 Find & Change Findings... (Ctrl+F / F3)").clicked() {
+                    self.open_find_popup();
+                    ui.close_menu();
+                }
+                ui.separator();
+
                 if ui.button("⚙ Editor Settings...").clicked() {
                     self.show_editor_settings_modal = true;
                     ui.close_menu();
@@ -1660,27 +1885,37 @@ impl BookApp {
                 ui.checkbox(&mut self.markdown_in_editor, "Markdown In Editor");
                 ui.separator();
                 ui.label(egui::RichText::new("Font Family").weak().size(11.0));
-                if ui
-                    .radio_value(&mut self.font_family, FontFamilyChoice::Serif, "Sitka Text (Serif)")
-                    .clicked()
-                {
+                let mut import_font_from_menu = false;
+                let choices = self.all_font_choices();
+                let mut last_cat: Option<FontCategory> = None;
+                for choice in choices {
+                    let cat = choice.category();
+                    if last_cat != Some(cat) {
+                        if last_cat.is_some() {
+                            ui.separator();
+                        }
+                        ui.label(egui::RichText::new(cat.label()).weak().size(10.0));
+                        last_cat = Some(cat);
+                    }
+                    let label = choice.menu_label();
+                    if ui
+                        .radio_value(&mut self.font_family, choice.clone(), label)
+                        .clicked()
+                    {
+                        if let Some(prof) = self.active_profile_mut() {
+                            prof.font_family = choice;
+                        }
+                        self.save_settings_config();
+                        ui.close_menu();
+                    }
+                }
+                ui.separator();
+                if ui.button("📥 Import Font (.ttf)...").clicked() {
+                    import_font_from_menu = true;
                     ui.close_menu();
                 }
-                if ui
-                    .radio_value(
-                        &mut self.font_family,
-                        FontFamilyChoice::Proportional,
-                        "Segoe UI (Sans-Serif)",
-                    )
-                    .clicked()
-                {
-                    ui.close_menu();
-                }
-                if ui
-                    .radio_value(&mut self.font_family, FontFamilyChoice::Monospace, "Consolas (Monospace)")
-                    .clicked()
-                {
-                    ui.close_menu();
+                if import_font_from_menu {
+                    self.pick_and_import_ttf_font(ui.ctx(), true);
                 }
             });
 
@@ -1690,7 +1925,7 @@ impl BookApp {
                     if time.elapsed().as_secs() < 5 {
                         ui.label(
                             egui::RichText::new(format!("• {msg}"))
-                                .color(SCRIV_FOLDER_BLUE)
+                                .color(self.theme_accent_green())
                                 .size(11.0),
                         );
                         ui.separator();
@@ -1700,7 +1935,7 @@ impl BookApp {
                     if ui
                         .small_button(
                             egui::RichText::new(format!("{} — {}", p.title, p.author))
-                                .color(SCRIV_TEXT_MUTED)
+                                .color(self.theme_text_muted())
                                 .size(11.0),
                         )
                         .on_hover_text("Click to edit Book Title & Author...")
@@ -1725,9 +1960,9 @@ impl BookApp {
                 egui::RichText::new("◧")
                     .size(15.0)
                     .color(if !self.sidebar_collapsed {
-                        SCRIV_FOLDER_BLUE
+                        self.theme_accent_green()
                     } else {
-                        SCRIV_TEXT_DARK
+                        self.theme_text_dark()
                     }),
             )
             .min_size(egui::vec2(28.0, 26.0));
@@ -1746,8 +1981,8 @@ impl BookApp {
             ui.add_space(target_x - current_x);
 
             egui::Frame::NONE
-                .fill(egui::Color32::WHITE)
-                .stroke(egui::Stroke::new(1.0_f32, SCRIV_BORDER))
+                .fill(self.theme_input_bg())
+                .stroke(egui::Stroke::new(1.0_f32, self.theme_border()))
                 .corner_radius(2.0)
                 .inner_margin(egui::Margin::symmetric(12, 4))
                 .show(ui, |ui| {
@@ -1759,7 +1994,7 @@ impl BookApp {
                             ui.label(
                                 egui::RichText::new(active_title)
                                     .size(12.5)
-                                    .color(SCRIV_TEXT_DARK),
+                                    .color(self.theme_text_dark()),
                             );
                         },
                     );
@@ -2030,7 +2265,7 @@ impl BookApp {
                                         ui.painter().hline(
                                             end_sc_rect.x_range(),
                                             end_sc_rect.center().y,
-                                            egui::Stroke::new(2.0_f32, LEDGER_GREEN_PRIMARY),
+                                            egui::Stroke::new(2.0_f32, self.theme_accent_green()),
                                         );
                                     }
                                 }
@@ -2052,7 +2287,7 @@ impl BookApp {
                                 ui.painter().hline(
                                     header_resp.rect.x_range(),
                                     header_resp.rect.top(),
-                                    egui::Stroke::new(2.5_f32, LEDGER_GREEN_PRIMARY),
+                                    egui::Stroke::new(2.5_f32, self.theme_accent_green()),
                                 );
                             }
 
@@ -2081,7 +2316,7 @@ impl BookApp {
                                 ui.painter().hline(
                                     end_rect.x_range(),
                                     end_rect.center().y,
-                                    egui::Stroke::new(2.5_f32, LEDGER_GREEN_PRIMARY),
+                                    egui::Stroke::new(2.5_f32, self.theme_accent_green()),
                                 );
                             }
                         }
@@ -2323,7 +2558,7 @@ impl BookApp {
             ui.painter().hline(
                 row_resp.rect.x_range(),
                 row_resp.rect.top(),
-                egui::Stroke::new(2.5_f32, LEDGER_GREEN_PRIMARY),
+                egui::Stroke::new(2.5_f32, self.theme_accent_green()),
             );
         }
 
@@ -2380,27 +2615,41 @@ impl BookApp {
                     }
                 });
 
-            // Font Family Dropdown ("Sitka Text" / "Segoe UI" / "Consolas")
+            // Font Family Dropdown (Expanded Serif / Sans-Serif / Monospace + Imported TTFs)
+            let mut import_from_bar = false;
+            let choices = self.all_font_choices();
             egui::ComboBox::from_id_salt("scriv_font_family_combo")
                 .selected_text(self.font_family.name())
-                .width(115.0)
+                .width(135.0)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.font_family,
-                        FontFamilyChoice::Serif,
-                        "Sitka Text",
-                    );
-                    ui.selectable_value(
-                        &mut self.font_family,
-                        FontFamilyChoice::Proportional,
-                        "Segoe UI",
-                    );
-                    ui.selectable_value(
-                        &mut self.font_family,
-                        FontFamilyChoice::Monospace,
-                        "Consolas",
-                    );
+                    let mut last_cat: Option<FontCategory> = None;
+                    for choice in choices {
+                        let cat = choice.category();
+                        if last_cat != Some(cat) {
+                            if last_cat.is_some() {
+                                ui.separator();
+                            }
+                            ui.label(egui::RichText::new(cat.label()).weak().size(10.0));
+                            last_cat = Some(cat);
+                        }
+                        let is_selected = self.font_family == choice;
+                        if ui.selectable_label(is_selected, choice.name()).clicked() {
+                            self.font_family = choice.clone();
+                            if let Some(prof) = self.active_profile_mut() {
+                                prof.font_family = choice;
+                            }
+                            self.save_settings_config();
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("📥 Import Font (.ttf)...").clicked() {
+                        import_from_bar = true;
+                        ui.close_menu();
+                    }
                 });
+            if import_from_bar {
+                self.pick_and_import_ttf_font(ui.ctx(), true);
+            }
 
             // Font Size Combo
             egui::ComboBox::from_id_salt("scriv_font_size")
@@ -2566,14 +2815,34 @@ impl BookApp {
 
     /// Centered Paper Sheet with book-like margins, paper shadow, dynamic profile colors, and floating desktop feel.
     fn render_central_pane(&mut self, ui: &mut egui::Ui) {
-        let font_family = self.font_family.to_egui_family();
+        self.central_pane_rect = Some(ui.max_rect());
+
+        let font_family = self.font_family.to_egui_family(&self.registered_font_families);
         let effective_size = self.font_size * (self.zoom_percent as f32 / 100.0);
         let line_spacing = self.line_spacing;
         let show_markdown = self.markdown_in_editor;
         let writing_color = self.current_writing_color();
+        let page_color = self.current_page_color();
+        let lum_page = (page_color.r() as u32 * 299 + page_color.g() as u32 * 587 + page_color.b() as u32 * 114) / 1000;
+        let is_dark_paper = lum_page < 128;
+
+        let find_query_opt = if self.show_find_popup && !self.find_query.is_empty() {
+            Some(self.find_query.clone())
+        } else {
+            None
+        };
+        let find_case_sensitive = self.find_case_sensitive;
+        let current_match_byte = if self.show_find_popup && !self.find_query.is_empty() {
+            self.find_matches
+                .get(self.find_current_idx)
+                .filter(|m| self.selected_doc.as_ref() == Some(&m.doc))
+                .map(|m| m.byte_start)
+        } else {
+            None
+        };
 
         let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
-            highlight_markdown(
+            highlight_markdown_with_find(
                 ui,
                 text,
                 wrap_width,
@@ -2582,6 +2851,10 @@ impl BookApp {
                 line_spacing,
                 show_markdown,
                 writing_color,
+                find_query_opt.as_deref(),
+                find_case_sensitive,
+                current_match_byte,
+                is_dark_paper,
             )
         };
 
@@ -2594,10 +2867,6 @@ impl BookApp {
                 let total_width = ui.available_width();
                 let desired_paper_width = 720.0 * (self.zoom_percent as f32 / 100.0);
                 let side_padding = ((total_width - desired_paper_width) * 0.5).max(16.0);
-
-                let page_color = self.current_page_color();
-                let lum_page = (page_color.r() as u32 * 299 + page_color.g() as u32 * 587 + page_color.b() as u32 * 114) / 1000;
-                let is_dark_paper = lum_page < 128;
                 let paper_stroke = if is_dark_paper {
                     egui::Color32::from_rgb(52, 64, 56)
                 } else {
@@ -2642,11 +2911,31 @@ impl BookApp {
                                 .frame(false)
                                 .lock_focus(true);
 
-                            let response = ui.add(editor);
-                            if response.changed() {
+                            let output = editor.show(ui);
+                            if output.response.changed() {
                                 self.recompute_word_count();
                                 self.is_dirty = true;
                                 self.last_edit_time = Some(Instant::now());
+                                if self.show_find_popup {
+                                    self.refresh_find_matches();
+                                }
+                            }
+
+                            if self.find_scroll_to_match {
+                                if let Some(m) = self.find_matches.get(self.find_current_idx) {
+                                    if self.selected_doc.as_ref() == Some(&m.doc) {
+                                        let ccursor = egui::text::CCursor::new(m.char_start);
+                                        let cursor = output.galley.from_ccursor(ccursor);
+                                        let local_rect = output.galley.pos_from_cursor(&cursor);
+                                        let screen_rect =
+                                            local_rect.translate(output.galley_pos.to_vec2());
+                                        ui.scroll_to_rect(
+                                            screen_rect.expand(48.0),
+                                            Some(egui::Align::Center),
+                                        );
+                                    }
+                                }
+                                self.find_scroll_to_match = false;
                             }
                         });
                 });
@@ -3075,7 +3364,7 @@ impl BookApp {
                         .as_ref()
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|| "No .scriv project selected".to_string());
-                    ui.label(egui::RichText::new(src_display).size(11.0).color(SCRIV_TEXT_MUTED));
+                    ui.label(egui::RichText::new(src_display).size(11.0).color(self.theme_text_muted()));
                     ui.horizontal(|ui| {
                         if ui.button("📂 Select .scriv Folder...").clicked() {
                             browse_source_folder = true;
@@ -3094,7 +3383,7 @@ impl BookApp {
                         .as_ref()
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|| "No destination folder selected".to_string());
-                    ui.label(egui::RichText::new(dst_display).size(11.0).color(SCRIV_TEXT_MUTED));
+                    ui.label(egui::RichText::new(dst_display).size(11.0).color(self.theme_text_muted()));
                     if ui.button("📂 Choose Destination Folder...").clicked() {
                         browse_dest_folder = true;
                     }
@@ -3118,7 +3407,7 @@ impl BookApp {
                                 .strong()
                                 .color(egui::Color32::WHITE),
                         )
-                        .fill(SCRIV_FOLDER_BLUE);
+                        .fill(self.theme_accent_green());
 
                         if ui.add_enabled(can_import, import_btn).clicked() {
                             run_import = true;
@@ -3199,6 +3488,12 @@ impl BookApp {
 
         // 8. Save New Profile Modal
         self.render_new_profile_modal(ctx);
+
+        // 9. Confirm Change Findings Modal
+        self.render_replace_confirm_modal(ctx);
+
+        // 10. Compile PDF Options Modal
+        self.render_compile_modal(ctx);
     }
 
     /// Renders the comprehensive Editor Settings & Profiles configuration dialog.
@@ -3361,54 +3656,52 @@ impl BookApp {
 
                 ui.separator();
 
-                // 3. Typography: Font Family, Font Size, Line Spacing
-                ui.label(egui::RichText::new("🔤 Typography").strong());
+                // 3. Typography: Font Family, Import TTF, Font Size, Line Spacing
+                ui.label(egui::RichText::new("🔤 Typography & Fonts").strong());
+                let mut trigger_import_font = false;
+                let mut remove_font_name: Option<String> = None;
                 ui.horizontal(|ui| {
                     ui.label("Font Family:");
+                    let choices = self.all_font_choices();
+                    let selected_label = self.font_family.name().to_string();
                     egui::ComboBox::from_id_salt("editor_settings_font_combo")
-                        .selected_text(self.font_family.name())
-                        .width(140.0)
+                        .selected_text(selected_label)
+                        .width(175.0)
                         .show_ui(ui, |ui| {
                             let mut changed = false;
-                            if ui
-                                .selectable_value(
-                                    &mut self.font_family,
-                                    FontFamilyChoice::Serif,
-                                    "Sitka Text (Serif)",
-                                )
-                                .clicked()
-                            {
-                                changed = true;
-                            }
-                            if ui
-                                .selectable_value(
-                                    &mut self.font_family,
-                                    FontFamilyChoice::Proportional,
-                                    "Segoe UI (Sans)",
-                                )
-                                .clicked()
-                            {
-                                changed = true;
-                            }
-                            if ui
-                                .selectable_value(
-                                    &mut self.font_family,
-                                    FontFamilyChoice::Monospace,
-                                    "Consolas (Mono)",
-                                )
-                                .clicked()
-                            {
-                                changed = true;
+                            let mut last_cat: Option<FontCategory> = None;
+                            for choice in choices {
+                                let cat = choice.category();
+                                if last_cat != Some(cat) {
+                                    if last_cat.is_some() {
+                                        ui.separator();
+                                    }
+                                    ui.label(egui::RichText::new(cat.label()).weak().size(10.0));
+                                    last_cat = Some(cat);
+                                }
+                                let is_sel = self.font_family == choice;
+                                if ui.selectable_label(is_sel, choice.menu_label()).clicked() {
+                                    self.font_family = choice;
+                                    changed = true;
+                                }
                             }
                             if changed {
-                                let fam = self.font_family;
+                                let fam = self.font_family.clone();
                                 if let Some(prof) = self.active_profile_mut() {
                                     prof.font_family = fam;
                                 }
                             }
                         });
 
-                    ui.add_space(10.0);
+                    if ui
+                        .button("📥 Import .ttf...")
+                        .on_hover_text("Import a singular TrueType (.ttf) font file into available fonts & custom profiles")
+                        .clicked()
+                    {
+                        trigger_import_font = true;
+                    }
+
+                    ui.add_space(6.0);
                     ui.label("Font Size:");
                     let mut sz = self.font_size;
                     if ui
@@ -3421,6 +3714,44 @@ impl BookApp {
                         }
                     }
                 });
+
+                if !self.imported_fonts.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new("Imported TTFs:").weak().size(11.0));
+                        let mut select_imp: Option<String> = None;
+                        for imp in &self.imported_fonts {
+                            let is_active = self.font_family == FontFamilyChoice::Custom(imp.name.clone());
+                            if ui
+                                .selectable_label(is_active, &imp.name)
+                                .on_hover_text(format!("Typst family: {} ({})", imp.typst_family, imp.path.display()))
+                                .clicked()
+                            {
+                                select_imp = Some(imp.name.clone());
+                            }
+                            if ui
+                                .small_button(egui::RichText::new("✕").size(10.0).color(egui::Color32::from_rgb(200, 70, 70)))
+                                .on_hover_text(format!("Remove imported font '{}'", imp.name))
+                                .clicked()
+                            {
+                                remove_font_name = Some(imp.name.clone());
+                            }
+                        }
+                        if let Some(sel_name) = select_imp {
+                            let fam = FontFamilyChoice::Custom(sel_name);
+                            self.font_family = fam.clone();
+                            if let Some(prof) = self.active_profile_mut() {
+                                prof.font_family = fam;
+                            }
+                        }
+                    });
+                }
+
+                if trigger_import_font {
+                    self.pick_and_import_ttf_font(ui.ctx(), true);
+                }
+                if let Some(name) = remove_font_name {
+                    self.remove_imported_font(&name, Some(ui.ctx()));
+                }
 
                 ui.horizontal(|ui| {
                     ui.label("Line Spacing:");
@@ -3458,7 +3789,7 @@ impl BookApp {
                 ui.label(egui::RichText::new("👁 Live Paper Preview").strong());
                 let preview_page = self.current_page_color();
                 let preview_text = self.current_writing_color();
-                let preview_family = self.font_family.to_egui_family();
+                let preview_family = self.font_family.to_egui_family(&self.registered_font_families);
                 let preview_font_size = self.font_size.clamp(11.0, 18.0);
 
                 egui::Frame::NONE
@@ -3591,39 +3922,286 @@ impl BookApp {
             self.show_new_profile_modal = false;
         }
     }
-}
 
-/// Loads Windows system Serif font (Georgia or Times New Roman) for literary Sitka/Serif manuscript feel.
-fn load_system_serif_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    let serif_candidates = [
-        r"C:\Windows\Fonts\georgia.ttf",
-        r"C:\Windows\Fonts\times.ttf",
-    ];
-    let mut loaded_serif = false;
-    for path in serif_candidates {
-        if let Ok(bytes) = std::fs::read(path) {
-            fonts.font_data.insert(
-                "system_serif".to_owned(),
-                Arc::new(egui::FontData::from_owned(bytes)),
-            );
-            loaded_serif = true;
-            break;
+    /// Renders the Compile Manuscript to PDF options modal dialog.
+    fn render_compile_modal(&mut self, ctx: &egui::Context) {
+        if !self.show_compile_modal {
+            return;
+        }
+
+        let mut close_modal = false;
+        let mut start_compile = false;
+        let mut import_font = false;
+
+        let active_title = self
+            .project
+            .as_ref()
+            .map(|p| format!("{} — {}", p.title, p.author))
+            .unwrap_or_else(|| "Manuscript".to_string());
+
+        egui::Window::new("🖨 Compile Book to 6×9 PDF")
+            .collapsible(false)
+            .resizable(true)
+            .default_size([520.0, 440.0])
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.y = 8.0;
+
+                ui.label(
+                    egui::RichText::new(active_title)
+                        .size(12.0)
+                        .color(self.theme_text_muted()),
+                );
+                ui.separator();
+
+                // 1. Style Mode Selection
+                ui.label(egui::RichText::new("Export Style").strong());
+                ui.radio_value(
+                    &mut self.compile_use_custom_style,
+                    false,
+                    "Default Print (Libertinus Serif / Georgia, 10.5 pt, Black on White)",
+                );
+                ui.radio_value(
+                    &mut self.compile_use_custom_style,
+                    true,
+                    "Custom Styling (Choose Font, Font Size & Colors)",
+                );
+
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button("📋 Match Active Editor Profile")
+                        .on_hover_text("Copy font, font size, and colors from your current editor profile")
+                        .clicked()
+                    {
+                        self.compile_use_custom_style = true;
+                        self.compile_font_family = self.font_family.clone();
+                        self.compile_font_size = self.font_size;
+                        let wc = self.current_writing_color();
+                        let pc = self.current_page_color();
+                        self.compile_text_color = [wc.r(), wc.g(), wc.b()];
+                        self.compile_page_color = [pc.r(), pc.g(), pc.b()];
+                    }
+                    if ui
+                        .small_button("↺ Reset Custom to Default")
+                        .clicked()
+                    {
+                        self.compile_font_family = FontFamilyChoice::Serif;
+                        self.compile_font_size = 10.5;
+                        self.compile_text_color = [0, 0, 0];
+                        self.compile_page_color = [255, 255, 255];
+                    }
+                });
+
+                // 2. Custom Font, Size, and Color Controls
+                ui.add_enabled_ui(self.compile_use_custom_style, |ui| {
+                    ui.separator();
+                    ui.label(egui::RichText::new("🔤 Font & Size").strong());
+
+                    let choices = self.all_font_choices();
+                    ui.horizontal(|ui| {
+                        ui.label("Font:");
+                        egui::ComboBox::from_id_salt("compile_font_combo")
+                            .selected_text(self.compile_font_family.name())
+                            .width(195.0)
+                            .show_ui(ui, |ui| {
+                                let mut last_cat: Option<FontCategory> = None;
+                                for choice in choices {
+                                    let cat = choice.category();
+                                    if last_cat != Some(cat) {
+                                        if last_cat.is_some() {
+                                            ui.separator();
+                                        }
+                                        ui.label(egui::RichText::new(cat.label()).weak().size(10.0));
+                                        last_cat = Some(cat);
+                                    }
+                                    let is_sel = self.compile_font_family == choice;
+                                    if ui.selectable_label(is_sel, choice.menu_label()).clicked() {
+                                        self.compile_font_family = choice;
+                                    }
+                                }
+                            });
+
+                        if ui
+                            .button("📥 Import .ttf...")
+                            .on_hover_text("Import a TrueType (.ttf) font file")
+                            .clicked()
+                        {
+                            import_font = true;
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Font Size:");
+                        ui.add(
+                            egui::Slider::new(&mut self.compile_font_size, 8.0..=24.0)
+                                .step_by(0.5)
+                                .suffix(" pt"),
+                        );
+                        for preset in [10.0_f32, 10.5, 11.0, 12.0, 14.0] {
+                            let label = if (preset - 10.5).abs() < 0.01 {
+                                "10.5pt".to_string()
+                            } else {
+                                format!("{}pt", preset as u32)
+                            };
+                            if ui
+                                .selectable_label(
+                                    (self.compile_font_size - preset).abs() < 0.05,
+                                    label,
+                                )
+                                .clicked()
+                            {
+                                self.compile_font_size = preset;
+                            }
+                        }
+                    });
+
+                    ui.separator();
+                    ui.label(egui::RichText::new("🎨 Export Colors").strong());
+                    ui.columns(2, |columns| {
+                        columns[0].vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Text Color:");
+                                ui.color_edit_button_srgb(&mut self.compile_text_color);
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                for (name, rgb) in [
+                                    ("Black", [0, 0, 0]),
+                                    ("Charcoal", [30, 36, 32]),
+                                    ("Espresso", [42, 36, 33]),
+                                    ("Sage", [226, 236, 229]),
+                                    ("White", [255, 255, 255]),
+                                ] {
+                                    if ui
+                                        .small_button(
+                                            egui::RichText::new(format!("■ {name}"))
+                                                .color(egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2])),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.compile_text_color = rgb;
+                                    }
+                                }
+                            });
+                        });
+
+                        columns[1].vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Page Color:");
+                                ui.color_edit_button_srgb(&mut self.compile_page_color);
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                for (name, rgb) in [
+                                    ("White", [255, 255, 255]),
+                                    ("Ivory", [250, 246, 238]),
+                                    ("Sepia", [244, 236, 216]),
+                                    ("Slate", [34, 38, 36]),
+                                    ("Obsidian", [22, 25, 24]),
+                                ] {
+                                    if ui
+                                        .small_button(
+                                            egui::RichText::new(format!("■ {name}"))
+                                                .color(egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2])),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.compile_page_color = rgb;
+                                    }
+                                }
+                            });
+                        });
+                    });
+                });
+
+                // 3. Live Preview Strip
+                ui.separator();
+                let (preview_bg, preview_fg, preview_family, preview_sz, preview_title) =
+                    if self.compile_use_custom_style {
+                        (
+                            egui::Color32::from_rgb(
+                                self.compile_page_color[0],
+                                self.compile_page_color[1],
+                                self.compile_page_color[2],
+                            ),
+                            egui::Color32::from_rgb(
+                                self.compile_text_color[0],
+                                self.compile_text_color[1],
+                                self.compile_text_color[2],
+                            ),
+                            self.compile_font_family
+                                .to_egui_family(&self.registered_font_families),
+                            self.compile_font_size.clamp(9.0, 18.0),
+                            format!(
+                                "Preview — {} • {:.1} pt",
+                                self.compile_font_family.name(),
+                                self.compile_font_size
+                            ),
+                        )
+                    } else {
+                        (
+                            egui::Color32::WHITE,
+                            egui::Color32::BLACK,
+                            FontFamilyChoice::Serif
+                                .to_egui_family(&self.registered_font_families),
+                            11.5,
+                            "Preview — Default Print (Libertinus Serif / Georgia • 10.5 pt)"
+                                .to_string(),
+                        )
+                    };
+
+                ui.label(
+                    egui::RichText::new(preview_title)
+                        .size(11.0)
+                        .color(self.theme_text_muted()),
+                );
+                egui::Frame::NONE
+                    .fill(preview_bg)
+                    .stroke(egui::Stroke::new(1.0_f32, self.theme_border()))
+                    .corner_radius(3.0)
+                    .inner_margin(egui::Margin::symmetric(14, 10))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            egui::RichText::new(
+                                "It was the best of drafts, printed with crisp margins and deliberate ink.",
+                            )
+                            .font(egui::FontId::new(preview_sz, preview_family))
+                            .color(preview_fg),
+                        );
+                    });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let compile_btn = egui::Button::new(
+                        egui::RichText::new("📄 Compile & Save PDF...")
+                            .strong()
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(self.theme_accent_green());
+
+                    if ui.add(compile_btn).clicked() {
+                        start_compile = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close_modal = true;
+                    }
+                });
+            });
+
+        if import_font {
+            if let Some(choice) = self.pick_and_import_ttf_font(ctx, false) {
+                self.compile_use_custom_style = true;
+                self.compile_font_family = choice;
+            }
+        }
+        if start_compile {
+            if self.execute_compile_pdf() {
+                close_modal = true;
+            }
+        }
+        if close_modal {
+            self.show_compile_modal = false;
         }
     }
-
-    let mut serif_list = Vec::new();
-    if loaded_serif {
-        serif_list.push("system_serif".to_owned());
-    }
-    if let Some(prop) = fonts.families.get(&egui::FontFamily::Proportional) {
-        serif_list.extend(prop.iter().cloned());
-    }
-    fonts
-        .families
-        .insert(egui::FontFamily::Name("Serif".into()), serif_list);
-
-    ctx.set_fonts(fonts);
 }
 
 /// Formats an integer with thousands separators (e.g. `2458` -> `"2,458"`).
@@ -3650,6 +4228,42 @@ fn char_idx_to_byte_idx(s: &str, char_idx: usize) -> usize {
 
 /// Highlight markdown headings, bold (**bold**), and italic (*italic*) text in the editor.
 /// Preserves 100% of characters so cursor navigation and text selections remain pixel-perfect.
+fn highlight_markdown_with_find(
+    ui: &egui::Ui,
+    text: &str,
+    wrap_width: f32,
+    font_family: egui::FontFamily,
+    base_size: f32,
+    line_spacing: f32,
+    show_markdown: bool,
+    writing_color: egui::Color32,
+    find_query: Option<&str>,
+    find_case_sensitive: bool,
+    current_match_byte_start: Option<usize>,
+    is_dark_paper: bool,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = build_markdown_layout_job(
+        text,
+        wrap_width,
+        font_family,
+        base_size,
+        line_spacing,
+        show_markdown,
+        writing_color,
+    );
+    if let Some(q) = find_query {
+        apply_search_highlights_to_job(
+            &mut job,
+            q,
+            find_case_sensitive,
+            current_match_byte_start,
+            is_dark_paper,
+        );
+    }
+    ui.fonts(|f| f.layout_job(job))
+}
+
+#[allow(dead_code)]
 fn highlight_markdown(
     ui: &egui::Ui,
     text: &str,
@@ -3660,6 +4274,27 @@ fn highlight_markdown(
     show_markdown: bool,
     writing_color: egui::Color32,
 ) -> std::sync::Arc<egui::Galley> {
+    let job = build_markdown_layout_job(
+        text,
+        wrap_width,
+        font_family,
+        base_size,
+        line_spacing,
+        show_markdown,
+        writing_color,
+    );
+    ui.fonts(|f| f.layout_job(job))
+}
+
+fn build_markdown_layout_job(
+    text: &str,
+    wrap_width: f32,
+    font_family: egui::FontFamily,
+    base_size: f32,
+    line_spacing: f32,
+    show_markdown: bool,
+    writing_color: egui::Color32,
+) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = wrap_width;
 
@@ -3765,7 +4400,7 @@ fn highlight_markdown(
         }
     }
 
-    ui.fonts(|f| f.layout_job(job))
+    job
 }
 
 fn highlight_inline_spans(
@@ -3959,6 +4594,7 @@ mod tests {
         fs::write(&file_path, "Content written directly to file system.").expect("write file");
 
         let mut app = BookApp::default();
+        app.skip_settings_save = true;
         app.set_project(proj);
         app.select_scene(0, 0);
 
@@ -4180,6 +4816,7 @@ mod tests {
         assert_eq!(deserialized.profiles.len(), 6);
 
         let mut app = BookApp::default();
+        app.skip_settings_save = true;
         assert_eq!(app.active_profile_name, "Default Ledger");
         assert_eq!(app.current_page_color(), egui::Color32::from_rgb(255, 255, 255));
 
@@ -4203,5 +4840,120 @@ mod tests {
         app.dark_mode = true;
         assert!(app.is_dark_mode());
         assert_eq!(app.theme_menu_bar_bg(), egui::Color32::from_rgb(26, 32, 28));
+    }
+
+    #[test]
+    fn test_dark_mode_toolbar_title_box_colors() {
+        let mut app = BookApp::default();
+        assert_eq!(app.theme_input_bg(), egui::Color32::WHITE);
+        assert_eq!(app.theme_border(), SCRIV_BORDER);
+        assert_eq!(app.theme_text_dark(), SCRIV_TEXT_DARK);
+
+        app.dark_mode = true;
+        assert_eq!(app.theme_input_bg(), egui::Color32::from_rgb(28, 35, 30));
+        assert_eq!(app.theme_border(), egui::Color32::from_rgb(46, 58, 50));
+        assert_eq!(app.theme_text_dark(), egui::Color32::from_rgb(226, 236, 230));
+
+        // Render the main toolbar in dark mode and ensure the active document box paints dark input fill
+        let ctx = egui::Context::default();
+        app.apply_visuals(&ctx);
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::TopBottomPanel::top("test_toolbar")
+                .frame(egui::Frame::NONE.fill(app.theme_toolbar_bg()))
+                .show(ctx, |ui| {
+                    app.render_scrivener_main_toolbar(ui);
+                });
+        });
+
+        let has_dark_box_fill = output.shapes.iter().any(|clipped| {
+            matches!(
+                &clipped.shape,
+                egui::epaint::Shape::Rect(rect) if rect.fill == app.theme_input_bg()
+            )
+        });
+        assert!(has_dark_box_fill, "Toolbar active document box should use dark theme_input_bg fill");
+
+        let has_pure_white_rect_fill = output.shapes.iter().any(|clipped| {
+            matches!(
+                &clipped.shape,
+                egui::epaint::Shape::Rect(rect) if rect.fill == egui::Color32::WHITE
+            )
+        });
+        assert!(
+            !has_pure_white_rect_fill,
+            "Toolbar should not paint pure white rectangle fills in dark mode"
+        );
+    }
+
+    #[test]
+    fn test_import_ttf_font_integrates_with_custom_profile_and_compile_menu() {
+        let sample_src = PathBuf::from(r"C:\Windows\Fonts\georgia.ttf");
+        if !sample_src.exists() {
+            return;
+        }
+
+        let temp_dir = std::env::temp_dir().join("test_app_ttf_profile_compile");
+        let _ = fs::remove_dir_all(&temp_dir);
+        let staging = temp_dir.join("staging");
+        let storage = temp_dir.join("imported_fonts");
+        fs::create_dir_all(&staging).unwrap();
+        let staged_ttf = staging.join("NovelImported.ttf");
+        fs::copy(&sample_src, &staged_ttf).unwrap();
+
+        let proj = BookProject::create_novel_blueprint(&temp_dir.join("proj"), "Font Book", "Writer")
+            .expect("create blueprint");
+
+        let mut app = BookApp::default();
+        app.set_project(proj);
+
+        let ctx = egui::Context::default();
+        let imp = app
+            .import_ttf_font_from_path(&staged_ttf, &storage, Some(&ctx), true)
+            .expect("import ttf into app");
+
+        // Selected in editor and listed in all_font_choices
+        assert_eq!(app.font_family, FontFamilyChoice::Custom(imp.name.clone()));
+        assert!(app
+            .all_font_choices()
+            .contains(&FontFamilyChoice::Custom(imp.name.clone())));
+
+        // Integrated into a custom profile
+        app.font_size = 17.0;
+        app.create_profile_from_current("Imported Font Profile".to_string());
+        let prof = app
+            .profiles
+            .iter()
+            .find(|p| p.name == "Imported Font Profile")
+            .expect("custom profile created");
+        assert_eq!(prof.font_family, FontFamilyChoice::Custom(imp.name.clone()));
+        assert_eq!(prof.font_size, 17.0);
+
+        // Compile modal defaults to default print style, then accepts custom font/size/colors
+        app.open_compile_modal();
+        assert!(app.show_compile_modal);
+        let default_opts = app.build_compile_options();
+        assert!(!default_opts.use_custom_style);
+
+        app.compile_use_custom_style = true;
+        app.compile_font_family = FontFamilyChoice::Custom(imp.name.clone());
+        app.compile_font_size = 13.5;
+        app.compile_text_color = [230, 235, 232];
+        app.compile_page_color = [25, 30, 28];
+
+        let custom_opts = app.build_compile_options();
+        assert!(custom_opts.use_custom_style);
+        assert_eq!(
+            custom_opts.font_family,
+            FontFamilyChoice::Custom(imp.name.clone())
+        );
+        assert_eq!(custom_opts.font_size, 13.5);
+        assert!(custom_opts.custom_font_dirs.contains(&storage));
+
+        // Render compile modal in egui without panic
+        let _ = ctx.run(Default::default(), |ctx| {
+            app.render_compile_modal(ctx);
+        });
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

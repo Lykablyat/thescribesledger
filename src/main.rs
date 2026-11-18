@@ -27,13 +27,13 @@ fn main() -> eframe::Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1150.0, 750.0])
             .with_min_inner_size([720.0, 480.0])
-            .with_title("The Scribe's Ledger v1.0.2")
+            .with_title(concat!("The Scribe's Ledger v", env!("CARGO_PKG_VERSION")))
             .with_icon(icon),
         ..Default::default()
     };
 
     eframe::run_native(
-        "The Scribe's Ledger v1.0.2",
+        concat!("The Scribe's Ledger v", env!("CARGO_PKG_VERSION")),
         native_options,
         Box::new(|cc| Ok(Box::new(ScribesLedgerApp::new(cc)))),
     )

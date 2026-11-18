@@ -1,12 +1,23 @@
+use crate::compiler::{is_boilerplate_scene_heading, replace_placeholders, CompileOptions};
+use crate::fonts::FontCategory;
+use crate::project::{BookProject, ChapterKind};
+use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
-use anyhow::{Context, Result};
-use crate::compiler::{is_boilerplate_scene_heading, replace_placeholders};
-use crate::project::{BookProject, ChapterKind};
 
-/// Compiles a `BookProject` into a formatted PDF file.
+/// Compiles a `BookProject` into a formatted PDF file with default print styling.
 pub fn compile_book_to_pdf<P: AsRef<Path>>(project: &BookProject, output_path: P) -> Result<()> {
-    let mut doc = SimplePdf::new(&project.title, &project.author);
+    compile_book_to_pdf_with_options(project, output_path, &CompileOptions::default())
+}
+
+/// Compiles a `BookProject` into a formatted PDF file using the fallback pure-Rust generator
+/// and respecting `CompileOptions` (base font category, font size, text & page colors).
+pub fn compile_book_to_pdf_with_options<P: AsRef<Path>>(
+    project: &BookProject,
+    output_path: P,
+    options: &CompileOptions,
+) -> Result<()> {
+    let mut doc = SimplePdf::new(&project.title, &project.author, options);
 
     // 1. Title Page (first page)
     doc.start_page();
@@ -80,6 +91,10 @@ struct SimplePdf {
     title: String,
     author: String,
     pages: Vec<PdfPage>,
+    base_font_size: f32,
+    text_color: [u8; 3],
+    page_color: [u8; 3],
+    pdf_fonts: (&'static str, &'static str, &'static str),
 }
 
 struct PdfPage {
@@ -87,7 +102,7 @@ struct PdfPage {
     current_y: f32,
 }
 
-const PAGE_WIDTH: f32 = 595.28;  // A4 width in pt
+const PAGE_WIDTH: f32 = 595.28; // A4 width in pt
 const PAGE_HEIGHT: f32 = 841.89; // A4 height in pt
 const MARGIN_LEFT: f32 = 54.0;
 const MARGIN_RIGHT: f32 = 54.0;
@@ -95,11 +110,38 @@ const MARGIN_TOP: f32 = 780.0;
 const MARGIN_BOTTOM: f32 = 54.0;
 
 impl SimplePdf {
-    pub fn new(title: &str, author: &str) -> Self {
+    pub fn new(title: &str, author: &str, options: &CompileOptions) -> Self {
+        let (base_font_size, text_color, page_color, pdf_fonts) = if options.use_custom_style {
+            let fonts = match options.font_family.category() {
+                FontCategory::Serif => ("Times-Roman", "Times-Bold", "Times-Italic"),
+                FontCategory::Monospace => ("Courier", "Courier-Bold", "Courier-Oblique"),
+                FontCategory::SansSerif | FontCategory::Custom => {
+                    ("Helvetica", "Helvetica-Bold", "Helvetica-Oblique")
+                }
+            };
+            (
+                options.font_size.clamp(7.0, 32.0),
+                options.text_color,
+                options.page_color,
+                fonts,
+            )
+        } else {
+            (
+                11.0,
+                [0, 0, 0],
+                [255, 255, 255],
+                ("Helvetica", "Helvetica-Bold", "Helvetica-Oblique"),
+            )
+        };
+
         Self {
             title: title.to_string(),
             author: author.to_string(),
             pages: Vec::new(),
+            base_font_size,
+            text_color,
+            page_color,
+            pdf_fonts,
         }
     }
 
@@ -126,22 +168,33 @@ impl SimplePdf {
     }
 
     pub fn add_heading_1(&mut self, text: &str, centered: bool) {
-        self.render_line(text, 22.0, "F2", centered, 32.0);
+        let sz = (self.base_font_size * 1.9).clamp(16.0, 34.0);
+        self.render_line(text, sz, "F2", centered, sz * 1.45);
     }
 
     pub fn add_heading_2(&mut self, text: &str, centered: bool) {
-        self.render_line(text, 16.0, "F2", centered, 24.0);
+        let sz = (self.base_font_size * 1.4).clamp(13.0, 26.0);
+        self.render_line(text, sz, "F2", centered, sz * 1.45);
     }
 
     pub fn add_body_text(&mut self, text: &str, centered: bool) {
-        self.render_line(text, 11.0, "F1", centered, 16.0);
+        let sz = self.base_font_size;
+        self.render_line(text, sz, "F1", centered, sz * 1.45);
     }
 
     pub fn add_italic_text(&mut self, text: &str, centered: bool) {
-        self.render_line(text, 11.0, "F3", centered, 16.0);
+        let sz = self.base_font_size;
+        self.render_line(text, sz, "F3", centered, sz * 1.45);
     }
 
-    fn render_line(&mut self, text: &str, font_size: f32, font_ref: &str, centered: bool, line_height: f32) {
+    fn render_line(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        font_ref: &str,
+        centered: bool,
+        line_height: f32,
+    ) {
         if self.current_page_mut().current_y - line_height < MARGIN_BOTTOM {
             self.start_page();
         }
@@ -159,8 +212,15 @@ impl SimplePdf {
             MARGIN_LEFT
         };
 
+        let r = self.text_color[0] as f32 / 255.0;
+        let g = self.text_color[1] as f32 / 255.0;
+        let b = self.text_color[2] as f32 / 255.0;
+
         let cmd = format!(
-            "BT /{font} {size} Tf 1 0 0 1 {x:.2} {y:.2} Tm ({text}) Tj ET",
+            "BT {r:.3} {g:.3} {b:.3} rg /{font} {size} Tf 1 0 0 1 {x:.2} {y:.2} Tm ({text}) Tj ET",
+            r = r,
+            g = g,
+            b = b,
             font = font_ref,
             size = font_size,
             x = x,
@@ -172,7 +232,8 @@ impl SimplePdf {
 
     pub fn render_markdown(&mut self, markdown: &str) {
         let printable_width = PAGE_WIDTH - MARGIN_LEFT - MARGIN_RIGHT;
-        let max_line_len = (printable_width / 6.5) as usize;
+        let approx_char_advance = (self.base_font_size * 0.55).max(4.5);
+        let max_line_len = (printable_width / approx_char_advance).max(24.0) as usize;
 
         let mut current_line = String::with_capacity(max_line_len + 16);
 
@@ -188,7 +249,8 @@ impl SimplePdf {
             } else if let Some(rest) = line.strip_prefix("## ") {
                 self.add_heading_2(rest.trim(), false);
             } else if let Some(rest) = line.strip_prefix("### ") {
-                self.render_line(rest.trim(), 13.0, "F2", false, 20.0);
+                let sz = (self.base_font_size * 1.15).clamp(11.0, 22.0);
+                self.render_line(rest.trim(), sz, "F2", false, sz * 1.45);
             } else if line.starts_with('*') && line.ends_with('*') && line.len() > 2 {
                 let text = &line[1..line.len() - 1];
                 self.add_italic_text(text, false);
@@ -196,7 +258,9 @@ impl SimplePdf {
                 // Stream words without allocating a Vec<&str>
                 current_line.clear();
                 for word in line.split_whitespace() {
-                    if !current_line.is_empty() && current_line.len() + word.len() + 1 > max_line_len {
+                    if !current_line.is_empty()
+                        && current_line.len() + word.len() + 1 > max_line_len
+                    {
                         self.add_body_text(&current_line, false);
                         current_line.clear();
                     }
@@ -238,17 +302,35 @@ impl SimplePdf {
         );
         pdf.extend_from_slice(pages_obj.as_bytes());
 
-        // Object 3: Helvetica (regular)
+        // Object 3: Regular font
         offsets.push(pdf.len());
-        pdf.extend_from_slice(b"3 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n");
+        pdf.extend_from_slice(
+            format!(
+                "3 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /{} /Encoding /WinAnsiEncoding >>\nendobj\n",
+                self.pdf_fonts.0
+            )
+            .as_bytes(),
+        );
 
-        // Object 4: Helvetica-Bold
+        // Object 4: Bold font
         offsets.push(pdf.len());
-        pdf.extend_from_slice(b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>\nendobj\n");
+        pdf.extend_from_slice(
+            format!(
+                "4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /{} /Encoding /WinAnsiEncoding >>\nendobj\n",
+                self.pdf_fonts.1
+            )
+            .as_bytes(),
+        );
 
-        // Object 5: Helvetica-Oblique
+        // Object 5: Italic/Oblique font
         offsets.push(pdf.len());
-        pdf.extend_from_slice(b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique /Encoding /WinAnsiEncoding >>\nendobj\n");
+        pdf.extend_from_slice(
+            format!(
+                "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /{} /Encoding /WinAnsiEncoding >>\nendobj\n",
+                self.pdf_fonts.2
+            )
+            .as_bytes(),
+        );
 
         // Pages and contents
         for (i, page) in self.pages.iter().enumerate() {
@@ -267,14 +349,33 @@ impl SimplePdf {
             pdf.extend_from_slice(page_entry.as_bytes());
 
             // Content stream
-            let mut stream_data = String::with_capacity(page.commands.len() * 64 + 64);
+            let mut stream_data = String::with_capacity(page.commands.len() * 64 + 128);
+            if self.page_color != [255, 255, 255] {
+                let pr = self.page_color[0] as f32 / 255.0;
+                let pg = self.page_color[1] as f32 / 255.0;
+                let pb = self.page_color[2] as f32 / 255.0;
+                stream_data.push_str(&format!(
+                    "{pr:.3} {pg:.3} {pb:.3} rg 0 0 {w:.2} {h:.2} re f\n",
+                    pr = pr,
+                    pg = pg,
+                    pb = pb,
+                    w = PAGE_WIDTH,
+                    h = PAGE_HEIGHT
+                ));
+            }
             for cmd in &page.commands {
                 stream_data.push_str(cmd);
                 stream_data.push('\n');
             }
             if i > 0 {
+                let r = self.text_color[0] as f32 / 255.0;
+                let g = self.text_color[1] as f32 / 255.0;
+                let b = self.text_color[2] as f32 / 255.0;
                 let footer = format!(
-                    "BT /F1 9 Tf 1 0 0 1 {x:.2} 36.00 Tm ({page_num}) Tj ET\n",
+                    "BT {r:.3} {g:.3} {b:.3} rg /F1 9 Tf 1 0 0 1 {x:.2} 36.00 Tm ({page_num}) Tj ET\n",
+                    r = r,
+                    g = g,
+                    b = b,
                     x = PAGE_WIDTH / 2.0 - 5.0,
                     page_num = i + 1
                 );
@@ -336,6 +437,7 @@ fn clean_pdf_string(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fonts::FontFamilyChoice;
     use std::fs;
 
     #[test]
@@ -352,7 +454,37 @@ mod tests {
         assert!(pdf_out.exists(), "pdf file should be created");
         let bytes = fs::read(&pdf_out).expect("read pdf");
         assert!(bytes.starts_with(b"%PDF-1.4"), "Valid PDF header");
-        assert!(bytes.ends_with(b"%%EOF\n") || bytes.ends_with(b"%%EOF"), "Valid PDF trailer");
+        assert!(
+            bytes.ends_with(b"%%EOF\n") || bytes.ends_with(b"%%EOF"),
+            "Valid PDF trailer"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_compile_book_to_pdf_with_custom_options() {
+        let temp_dir = std::env::temp_dir().join("test_book_compile_custom");
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let project = BookProject::create_novel_blueprint(&temp_dir, "Styled Novel", "Author")
+            .expect("create blueprint");
+
+        let pdf_out = temp_dir.join("styled.pdf");
+        let opts = CompileOptions {
+            use_custom_style: true,
+            font_family: FontFamilyChoice::TimesNewRoman,
+            font_size: 13.0,
+            text_color: [220, 230, 225],
+            page_color: [30, 35, 32],
+            imported_fonts: Vec::new(),
+            custom_font_dirs: Vec::new(),
+        };
+        compile_book_to_pdf_with_options(&project, &pdf_out, &opts).expect("compile custom pdf");
+
+        let content = String::from_utf8_lossy(&fs::read(&pdf_out).unwrap()).into_owned();
+        assert!(content.contains("/BaseFont /Times-Roman"));
+        assert!(content.contains("re f"));
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
